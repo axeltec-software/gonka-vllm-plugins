@@ -10,20 +10,6 @@ can find the rationale for the inline comment in `init_generate` in
 **Owners:** @baychak
 **Supersedes / amends:** none. **Amended by:** [ADR-0014](ADR-0014-plugin-vs-fork.md).
 
-## Context (why this file exists)
-
-`src/gonka_poc/poc/routes.py` carries an inline reference to ADR-0013 in
-`init_generate`:
-
-> Ordering contract (ADR-0013): gate.activate → abort_all_requests → spawn
-> gen task.
-
-Without a local ADR file, that comment is a dead link for anyone reading the
-plugin source tree in isolation. This stub closes the link-rot. The full
-architectural justification (three-layer plugin / shim / upstream story,
-fork history, options considered) lived in the original mlnode-foundry
-ADR ([public](https://github.com/kaitakuai/mlnode-foundry/blob/main/docs/adr/0013-poc-integration-architecture.md)) and is not duplicated here.
-
 ## Decision (the part the plugin code depends on)
 
 PoC `init/generate` MUST execute three steps in this exact order:
@@ -50,12 +36,6 @@ Inverting any pair breaks the contract:
 
 `gen_task.add_done_callback` deactivates the gate when generation finishes
 (or is cancelled) — see `_on_generation_done` in the same function.
-
-## Provenance
-
-Originated as mlnode-foundry ADR-0013 ([public](https://github.com/kaitakuai/mlnode-foundry/blob/main/docs/adr/0013-poc-integration-architecture.md)); this file is
-authoritative for this repo. The Decision section above carries the full
-contract the plugin code depends on.
 
 ## Dependencies
 

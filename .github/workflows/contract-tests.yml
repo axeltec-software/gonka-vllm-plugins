@@ -68,9 +68,8 @@ jobs:
     # vllm symbols exist; this job asserts that the gonka-vllm-serve CLI
     # actually composes against the real vllm wheel end-to-end. It catches
     # the "import path wrong, contract test enshrined the wrong path" class
-    # of bugs flagged in v3 review on ``cli_env_setup`` (the contract test
-    # mirrored the same import string the production code uses, so a
-    # wrong-path bug in production was invisible to the test).
+    # of bugs where a contract test mirrors the same import string the
+    # production code uses, so a wrong-path bug stays invisible to the test.
     #
     # We exercise three import surfaces:
     #   1. ``gonka-vllm-serve --help`` -- full CLI bring-up (cli_env_setup
@@ -144,7 +143,7 @@ jobs:
 
       - name: import cli_env_setup from current vllm
         # The original ``--help`` step was meant to surface ``cli_env_setup``
-        # import drift specifically (v3 review caught a wrong-path bug here).
+        # import drift specifically.
         # Reproduce that signal without the GPU-only argparse builder: import
         # the symbol directly and assert callability. Mirrors the lookup in
         # ``api_router.main()``.
@@ -156,10 +155,10 @@ jobs:
           "
 
       - name: import gonka_poc.poc.* (runtime-dep coverage)
-        # Closes v4 must-fix #3 (MAJOR): the smoke-help job previously had
-        # ZERO coverage of the ``gonka_poc.poc`` subpackage, so missing
-        # runtime deps that the poc.* modules transitively require
-        # (e.g. fix-A's scipy / aiohttp regression) slipped through CI.
+        # Without this the job has no coverage of the ``gonka_poc.poc``
+        # subpackage, and a missing runtime dep that poc.* requires
+        # transitively (scipy, aiohttp) passes CI and fails at import time
+        # in production.
         #
         # Each line below probes a distinct dep-surface:
         #   * ``poc.routes`` / ``poc.data`` / ``poc.callbacks`` -- the three
@@ -175,8 +174,8 @@ jobs:
           python -c "from gonka_poc.poc.callbacks import CallbackSender; print('callbacks.CallbackSender OK')"
 
       - name: vllm.general_plugins entry-point discovery + invocation
-        # Closes v4 must-fix #3 (MAJOR): the smoke-help job previously had
-        # ZERO coverage of the plugin entry-point. ``gonka-vllm-serve`` was
+        # Without this the job has no coverage of the plugin entry-point:
+        # ``gonka-vllm-serve`` would be
         # smoke-tested, but plain ``vllm serve`` users rely on vLLM
         # enumerating ``entry_points(group='vllm.general_plugins')`` and
         # loading our ``gonka_poc.plugin:register`` -- a pyproject typo or

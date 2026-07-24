@@ -11,21 +11,6 @@ model without leaving the package.
 **Owners:** @baychak
 **Amends:** [ADR-0013](ADR-0013-poc-gate-ordering.md).
 
-## Context (why this file exists)
-
-`README.md` cites ADR-0014 from two places:
-
-- Top-of-file status banner (`MIGRATION_FROM_FORK.md` + ADR-0014 explain
-  the two-artifact relationship).
-- "Why two artifacts" section (`see ADR-0014 in this repo's docs/adr/`).
-
-`tests/gonka/README.md` also cites it when explaining why
-`Dockerfile.quick` is not part of this repo. Without
-a local file, those citations are dead links. This stub closes the link-rot.
-The full options-considered narrative (status-quo, monkey-patch sampler,
-full-fork rebase, thin-fork-permanent) lives in the original mlnode-foundry
-ADR ([public](https://github.com/kaitakuai/mlnode-foundry/blob/main/docs/adr/0014-residual-fork-permanent-infra.md)) and is not duplicated here.
-
 ## Decision (the part the plugin's shipping model depends on)
 
 Gonka PoC ships as **two artifacts** on purpose:
@@ -71,11 +56,6 @@ Layer-3 question rather than inheriting this deferral as settled.
   part migrates into the plugin and the corresponding compat shim and
   fork commit go away. The shipping model survives the migration —
   consumers still install one plugin.
-
-## Provenance
-
-Originated as mlnode-foundry ADR-0014 ([public](https://github.com/kaitakuai/mlnode-foundry/blob/main/docs/adr/0014-residual-fork-permanent-infra.md)); this file is
-authoritative for this repo.
 
 ## Links
 

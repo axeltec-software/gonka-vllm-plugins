@@ -1,9 +1,7 @@
 # Contributing
 
-This package is a **plugin**, not a fork. It installs on a stock vLLM wheel and
-reaches into vLLM only through documented extension points. Most of the rules
-below exist to keep it that way, because the moment the plugin depends on vLLM
-internals in an undisciplined way, every vLLM minor becomes a porting project.
+This package is a **plugin**, not a fork: it installs on a stock vLLM wheel and
+reaches into vLLM only through documented extension points.
 
 ## The two hard rules
 
@@ -68,9 +66,8 @@ a change that fixes one and breaks the other is not done.
 
 ## Pull requests
 
-Describe *why*, not just *what* — the reasoning behind a compat shim is usually
-worth more than the shim. If a change is a workaround for an upstream bug, link
-the upstream issue so the workaround can be removed when it is fixed.
+If a change works around an upstream bug, link the upstream issue so the
+workaround can be removed once it is fixed.
 
 Decisions with lasting consequences go in `docs/adr/` and are summarised in
 `docs/decision-log.md`.

@@ -25,8 +25,8 @@ were later refactored away (see git history).*
 | `3efa985f8` | feat(poc): import PoC v2 module from 0.15.1 fork | `src/gonka_poc/poc/*` |
 | `2547cbc95` | feat(poc): stronger RNG via concat-murmur (upstream PR kaitakuai/vllm#30) | `src/gonka_poc/poc/{config,engine_patch,generate_queue,gpu_random,manager,poc_model_runner,routes}.py` |
 | `99a372d4e` | safer kv cache reuse (kv-reuse part; Dockerfile portion -> Section 2) | `src/gonka_poc/poc/poc_model_runner.py` |
-| `9ec7ab432` fix compilation skip | `src/gonka_poc/poc/poc_model_runner.py` (already final state) |
-| `4a4c921f0` add scratchpad (revert) | `src/gonka_poc/poc/poc_model_runner.py` (already final state) |
+| `9ec7ab432` | fix compilation skip | `src/gonka_poc/poc/poc_model_runner.py` (already final state) |
+| `4a4c921f0` | add scratchpad (revert) | `src/gonka_poc/poc/poc_model_runner.py` (already final state) |
 | `623ef37d7` feat(api): integrate PoC router and priority gating | `src/gonka_poc/entrypoint/{api_router,gating}.py` + reuse of `src/gonka_poc/poc/routes.py` |
 | `8f30fd4e2` chore(api): return token id as numeric string from _get_decoded_token | REPLACED by `src/gonka_poc/poc/routes.py` serialiser (do NOT port the `_get_decoded_token` edit -- emit numeric ids from PoC routes only) |
 | `582f087a5` fix(poc): restore seq_lens_cpu_upper_bound kwarg for MLA attention (kaitakuai/vllm#9) | `src/gonka_poc/_compat/v0_23.py::build_common_attention_metadata` |
@@ -41,41 +41,11 @@ Dockerfile base image -- the Dockerfile part is **foundry**, see Section 2.
 |-----|---------|-----------|
 | `15ee09f11` feat(models): add Qwen3MoeForCausalLMConfig with PoC custom_ops defaults | No real PoC-specific `custom_ops` exist for Qwen3MoE today -- the fork's `MODELS_CONFIG_MAP` entry was an aspirational scaffold with no concrete ops. When a real op is needed it will be added explicitly under a fresh module + wired from `plugin.register()`; carrying an empty seed invites confusion. |
 
-## 2. Foundry-profile commits (land in `mlnode-foundry`)
+## 2. Deployment defaults (not part of this package)
 
-All paths below are relative to `mlnode-foundry/`. None of these belong in
-the plugin.
-
-| SHA | Subject | mlnode-foundry destination |
-|-----|---------|----------------------------|
-| `75ad0684b` | chore(config): raise OpenAI API default max_num_batched_tokens | `profiles/gonka-poc/engine-args.yaml` (add key `max_num_batched_tokens`) |
-| `02f74e99a` | chore(docker): Dockerfile.quick overlay for vllm-openai:v0.19.0 | `profiles/gonka-poc/Dockerfile.overlay` (initial overlay -- base image, `VLLM_ALLOW_INSECURE_SERIALIZATION=1`, FlashInfer NVFP4/FP8 env) |
-| `fc77f468f` | chore(docker): bump Dockerfile.quick base to vllm-openai:v0.20.0 | `profiles/gonka-poc/Dockerfile.overlay` (base image bump) |
-| `c66d29e03` | chore(config): raise default gpu_memory_utilization to 0.925 for OpenAI API | `profiles/gonka-poc/engine-args.yaml` (`gpu_memory_utilization: 0.925`) |
-| `a2ffe9c2b` | bake attention_backend, logprobs_mode, compilation_config, max_num_batched_tokens defaults | `profiles/gonka-poc/engine-args.yaml` (`attention_backend: FLASHINFER`, `logprobs_mode: processed_logprobs`) |
-| `cb02223b2` | Fix attention backend (move to EngineArgs.attention_backend) | `profiles/gonka-poc/engine-args.yaml` (same key; ensure CLI shape) |
-| `c92077746` | fix default args -- wire --attention-backend CLI default to FLASHINFER | `profiles/gonka-poc/launch.sh` (CLI flag) OR `engine-args.yaml` |
-| `03f74653b` | hardcode dtype auto | `profiles/gonka-poc/engine-args.yaml` (`dtype: auto`) -- do NOT patch `vllm/config/model.py` |
-| `9e6d2735f` | chore(docker): bump Dockerfile.quick base to vllm-openai:v0.23.0 | `profiles/gonka-poc/Dockerfile.overlay` (base image bump) |
-| `99a372d4e` *(Dockerfile bump portion only)* | safer kv cache reuse (Dockerfile bump only) | `profiles/gonka-poc/Dockerfile.overlay` |
-| `423a5a591` | ci: add build-stage1 workflow for the vLLM overlay image (kaitakuai/vllm#10) | `.github/workflows/build-stage1.yml` (in `mlnode-foundry` -- includes cosign, SLSA, SBOM signing) |
-
-### Foundry-profile target file layout (recommended)
-
-```
-mlnode-foundry/
-  profiles/gonka-poc/
-    Dockerfile.overlay      # base = vllm/vllm-openai:v0.23.0-cu129
-    engine-args.yaml        # gpu_memory_utilization, dtype, attention_backend,
-                            # logprobs_mode, max_num_batched_tokens
-    launch.sh               # gonka-vllm-serve entrypoint + per-arch CLI flags
-  .github/workflows/
-    build-stage1.yml        # ported from 423a5a591
-```
-
-The overlay Dockerfile should `RUN pip install gonka-poc==<pinned>` on top of
-the stock vllm-openai image, then set
-`ENV VLLM_ALLOW_INSECURE_SERIALIZATION=1` and PoC env defaults.
+Image build settings and engine defaults were split out at port time and
+live in the deployment tooling, not here. The plugin has no build or
+runtime dependency on them.
 
 ## 3. Stays in fork until Layer 3 (upstream hook required)
 
@@ -96,9 +66,8 @@ each vllm minor bump. Move to plugin only after an upstream PR adds a hook.
 
 ### Upstream-PR backlog (to retire each item from the fork)
 
-Upstreaming is DEFERRED-INDEFINITELY per ADR-0014 (the fork is permanent
-infrastructure; this backlog records what WOULD retire each item; revisit
-under gonka-ai ownership).
+The status of the upstream track is recorded in ADR-0014; this section only
+lists what each PR would retire.
 
 1. **Sampler-stack hook**: PR upstream adding a `LogitsProcessor`-style
    per-request `enforced_token_ids` slot + `logprobs_mode` enum exposed on

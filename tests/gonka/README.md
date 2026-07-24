@@ -44,16 +44,8 @@ names, dataclass fields, method signatures). Run on every vLLM pin bump.
 
 ### Unit Tests + Contract Tests
 
-No GPU, no running server. From the repo root:
+CPU-only, no server needed. See [CONTRIBUTING.md](../../CONTRIBUTING.md).
 
-```bash
-pip install -e '.[test]'   # or:  pip install 'gonka-poc[test] @ git+https://github.com/kaitakuai/gonka-poc@main'
-pytest tests/unit tests/contract -v
-```
-
-`tests/contract/` and `tests/unit/test_compat_dispatch_smoke.py` import
-`vllm` and skip with `pytest.importorskip("vllm")` on contributor laptops
-that do not have a vLLM install.
 
 ### Live Tests
 
@@ -187,14 +179,3 @@ For PoC self-validation:
 - **L2 distance < 0.2** for individual pairs (test_02).
 - **Mean L2 < 0.1, max L2 < 0.3** across 20 pairs (test_06 — wider max to
   avoid flakes from float16 variance).
-
----
-
-## Where Dockerfile.quick went
-
-`Dockerfile.quick` lived inside the `kaitakuai/vllm` fork tree. It does
-not exist in `gonka-poc` and will not be added — the plugin's shipping
-model is `vllm/vllm-openai:v0.23.0-cu129` + `pip install gonka-poc`
-(ADR-0014). If you need the historical `Dockerfile.quick` workflow,
-check out the residual fork branch
-[`kaitakuai/vllm@poc-sampler-residual-v0.23`](https://github.com/kaitakuai/vllm/tree/poc-sampler-residual-v0.23).

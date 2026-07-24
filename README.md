@@ -3,13 +3,10 @@
 Out-of-tree vLLM plugin implementing **Gonka Proof-of-Compute v2** for stock
 `vllm` 0.23.x / 0.25.x wheels. Ships as a Python package -- no fork, no source patches.
 
-> **Status (2026-07-21):** The package is **not yet on PyPI**; install
-> directly from git (see Quick start below). Production deployments install
-> `gonka-poc` via pip on top of the per-minor residual wheel
-> (`poc-sampler-residual-vX.YY` scheme, ADR-0014); vLLM 0.23
-> and 0.25.1 are supported. How images are built is out of scope for this
-> package: it depends only on a vLLM install. See `MIGRATION_FROM_FORK.md` Section 3 and
-> ADR-0014 for the two-artifact relationship.
+> Not on PyPI yet — install from git (see Quick start). The plugin runs on top
+> of a residual wheel carrying the sampler patches; see ADR-0014 for why PoC
+> ships as two artifacts. Image building is out of scope here: this package
+> depends only on a vLLM install.
 
 ## What it provides
 
@@ -246,12 +243,11 @@ see **ADR-0014** in this repo's `docs/adr/`. Short version:
   these touch private vLLM internals (`vllm/v1/sample/*`,
   `vllm/v1/structured_output/*`, `vllm/v1/worker/gpu_input_batch.py`) with
   no public hook today.
-* The fork is rebuilt as `vllm==0.23.0+gonka.samplerN` for each vLLM minor
-  bump. Each upstream PR that adds a hook retires part of the fork; once
-  all three hooks land, the fork is archived and `pip install gonka-poc`
-  becomes the single artifact. Upstreaming is DEFERRED-INDEFINITELY per
-  ADR-0014 (the fork is permanent infrastructure; the backlog records what
-  WOULD retire each item; revisit under gonka-ai ownership).
+* The fork is rebuilt as `vllm==<minor>+gonka.samplerN` for each vLLM minor
+  bump. Each upstream PR that adds a hook would retire part of the fork; once
+  all three land, the fork is archived and `pip install gonka-poc` becomes the
+  single artifact. The status of that upstream track is recorded in ADR-0014 —
+  see there, not here, so the two do not drift apart.
 
 See `MIGRATION_FROM_FORK.md` Section 3 for the per-commit fork inventory
 and the upstream-PR backlog.

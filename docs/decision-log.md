@@ -12,16 +12,6 @@ anchor, and repointed the image builds at the tag.
 Matters because the package is being handed over to another organisation: a
 branch pin would silently start resolving to a different owner's HEAD.
 
-## 2026-07-24 — Pre-transfer documentation pass
-
-Removed statements that only made sense under the original ownership: the
-Layer-3 deferral is now "no owner assigned" rather than justified by one team's
-bandwidth, and the canonical ADRs are linked instead of being described as
-internal. Also fixed `#N` references that GitHub auto-linked to unrelated PRs in
-this repository.
-
-See [ADR-0014](adr/ADR-0014-plugin-vs-fork.md).
-
 ## 2026-07-20 — Validation runs on leased KV blocks
 
 PoC validation no longer aborts live inference: it borrows KV blocks where the
