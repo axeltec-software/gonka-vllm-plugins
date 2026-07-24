@@ -570,10 +570,11 @@ def test_sampling_params_has_fork_patches() -> None:
     if "+gonka.sampler" not in version:
         pytest.skip(
             f"vllm=={version!r} is the vanilla upstream wheel; this test "
-            f"requires a kaitakuai 0.25-based residual wheel — none exists "
-            f"yet (the 0.23 line ships vllm==0.23.0+gonka.sampler1). "
-            f"Production deployments MUST install the residual wheel — see "
-            f"MIGRATION_FROM_FORK.md."
+            f"requires a residual wheel carrying the sampler stack "
+            f"(local version suffix '+gonka.sampler', e.g. "
+            f"vllm==0.25.1+gonka.sampler1). Production deployments MUST "
+            f"install the residual wheel — see MIGRATION_FROM_FORK.md and "
+            f"docker/Dockerfile.gonka-poc in the vLLM residual repository."
         )
 
     mod = importlib.import_module("vllm.sampling_params")

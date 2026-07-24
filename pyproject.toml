@@ -44,6 +44,14 @@ test = [
   "aiohttp>=3.9",
 ]
 
+[project.urls]
+# Ownership note: the plugin is being handed over to the gonka-ai organisation.
+# These point at the current (pre-transfer) location; they are updated together
+# with the install instructions in README.md once the transfer completes, so the
+# docs and the package metadata never disagree.
+Repository = "https://github.com/kaitakuai/gonka-poc"
+Issues = "https://github.com/kaitakuai/gonka-poc/issues"
+
 [project.entry-points."vllm.general_plugins"]
 gonka_poc = "gonka_poc.plugin:register"
 

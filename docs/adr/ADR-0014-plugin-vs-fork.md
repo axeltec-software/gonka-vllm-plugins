@@ -1,8 +1,8 @@
 # ADR-0014 — Residual vLLM fork as permanent infrastructure (local stub)
 
 **Status:** Accepted (amends ADR-0013 §Layer-3). Originated as
-mlnode-foundry ADR-0014 (kaitakuai internal); this file is authoritative
-for this repo.
+mlnode-foundry ADR-0014 ([canonical copy](https://github.com/kaitakuai/mlnode-foundry/blob/main/docs/adr/0014-residual-fork-permanent-infra.md), public); this file is
+authoritative for this repo.
 This file is a 1-page summary so an offline reader of the `gonka-poc` repo
 can find the rationale for the two-artifact (plugin + thin fork) shipping
 model without leaving the package.
@@ -23,8 +23,8 @@ model without leaving the package.
 `Dockerfile.quick` is not part of this repo. Without
 a local file, those citations are dead links. This stub closes the link-rot.
 The full options-considered narrative (status-quo, monkey-patch sampler,
-full-fork rebase, thin-fork-permanent) lived in the original mlnode-foundry
-ADR (kaitakuai internal) and is not duplicated here.
+full-fork rebase, thin-fork-permanent) lives in the original mlnode-foundry
+ADR ([public](https://github.com/kaitakuai/mlnode-foundry/blob/main/docs/adr/0014-residual-fork-permanent-infra.md)) and is not duplicated here.
 
 ## Decision (the part the plugin's shipping model depends on)
 
@@ -46,13 +46,16 @@ Gonka PoC ships as **two artifacts** on purpose:
 
 The original ADR-0013 plan was to upstream the sampler hooks to
 `vllm-project/vllm` (Layer 3) and retire the fork. ADR-0014 marks that
-exit strategy as **DEFERRED-INDEFINITELY**: Kaitaku does not have the
-bandwidth or acceptance channel to drive upstream PRs through the
-`vllm-project` review process. The thin fork is therefore treated as
-**permanent infrastructure**, not a temporary bridge.
+exit strategy as **DEFERRED — no owner assigned for the upstream track**.
+No `vllm-project` PR is in flight and none is scheduled; until someone
+owns that track, the thin fork is treated as **permanent infrastructure**
+rather than a temporary bridge, and the shipping model must not assume the
+fork disappears.
 
 Status note: this decision was made under kaitakuai ownership
-(2026-06-16); revisit under gonka-ai ownership.
+(2026-06-16). Whoever owns the package next may well have an acceptance
+channel into `vllm-project` that was unavailable then — re-open the
+Layer-3 question rather than inheriting this deferral as settled.
 
 ## What this means operationally
 
@@ -71,7 +74,7 @@ Status note: this decision was made under kaitakuai ownership
 
 ## Provenance
 
-Originated as mlnode-foundry ADR-0014 (kaitakuai internal); this file is
+Originated as mlnode-foundry ADR-0014 ([public](https://github.com/kaitakuai/mlnode-foundry/blob/main/docs/adr/0014-residual-fork-permanent-infra.md)); this file is
 authoritative for this repo.
 
 ## Links

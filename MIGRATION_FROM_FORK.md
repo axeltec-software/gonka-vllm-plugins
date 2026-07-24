@@ -23,13 +23,13 @@ were later refactored away (see git history).*
 | SHA | Subject | Destination in plugin |
 |-----|---------|-----------------------|
 | `3efa985f8` | feat(poc): import PoC v2 module from 0.15.1 fork | `src/gonka_poc/poc/*` |
-| `2547cbc95` | feat(poc): stronger RNG via concat-murmur (upstream PR #30) | `src/gonka_poc/poc/{config,engine_patch,generate_queue,gpu_random,manager,poc_model_runner,routes}.py` |
+| `2547cbc95` | feat(poc): stronger RNG via concat-murmur (upstream PR kaitakuai/vllm#30) | `src/gonka_poc/poc/{config,engine_patch,generate_queue,gpu_random,manager,poc_model_runner,routes}.py` |
 | `99a372d4e` | safer kv cache reuse (kv-reuse part; Dockerfile portion -> Section 2) | `src/gonka_poc/poc/poc_model_runner.py` |
 | `9ec7ab432` fix compilation skip | `src/gonka_poc/poc/poc_model_runner.py` (already final state) |
 | `4a4c921f0` add scratchpad (revert) | `src/gonka_poc/poc/poc_model_runner.py` (already final state) |
 | `623ef37d7` feat(api): integrate PoC router and priority gating | `src/gonka_poc/entrypoint/{api_router,gating}.py` + reuse of `src/gonka_poc/poc/routes.py` |
 | `8f30fd4e2` chore(api): return token id as numeric string from _get_decoded_token | REPLACED by `src/gonka_poc/poc/routes.py` serialiser (do NOT port the `_get_decoded_token` edit -- emit numeric ids from PoC routes only) |
-| `582f087a5` fix(poc): restore seq_lens_cpu_upper_bound kwarg for MLA attention (#9) | `src/gonka_poc/_compat/v0_23.py::build_common_attention_metadata` |
+| `582f087a5` fix(poc): restore seq_lens_cpu_upper_bound kwarg for MLA attention (kaitakuai/vllm#9) | `src/gonka_poc/_compat/v0_23.py::build_common_attention_metadata` |
 | `d16c2127d` test(gonka): port PoC v2 live and unit tests from 0.15.1 fork | `tests/gonka/*` |
 
 The fork commit `99a372d4e` ("safer kv cache reuse") also bumps the
@@ -58,7 +58,7 @@ the plugin.
 | `03f74653b` | hardcode dtype auto | `profiles/gonka-poc/engine-args.yaml` (`dtype: auto`) -- do NOT patch `vllm/config/model.py` |
 | `9e6d2735f` | chore(docker): bump Dockerfile.quick base to vllm-openai:v0.23.0 | `profiles/gonka-poc/Dockerfile.overlay` (base image bump) |
 | `99a372d4e` *(Dockerfile bump portion only)* | safer kv cache reuse (Dockerfile bump only) | `profiles/gonka-poc/Dockerfile.overlay` |
-| `423a5a591` | ci: add build-stage1 workflow for kaitakuai/vllm overlay image (#10) | `.github/workflows/build-stage1.yml` (in `mlnode-foundry` -- includes cosign, SLSA, SBOM signing) |
+| `423a5a591` | ci: add build-stage1 workflow for the vLLM overlay image (kaitakuai/vllm#10) | `.github/workflows/build-stage1.yml` (in `mlnode-foundry` -- includes cosign, SLSA, SBOM signing) |
 
 ### Foundry-profile target file layout (recommended)
 

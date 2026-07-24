@@ -570,10 +570,10 @@ def test_sampling_params_has_fork_patches() -> None:
     if "+gonka.sampler" not in version:
         pytest.skip(
             f"vllm=={version!r} is the vanilla upstream wheel; this test "
-            f"requires the kaitakuai residual wheel (vllm==0.23.0+gonka.sampler1). "
+            f"requires the residual wheel (vllm==0.23.0+gonka.sampler1). "
             f"Production deployments MUST install the residual wheel — see "
             f"MIGRATION_FROM_FORK.md. CI exercises this assertion via the "
-            f"poc-sampler-residual-v0.23 branch's own contract suite."
+            f"residual branch's own contract suite in the vLLM fork."
         )
 
     mod = importlib.import_module("vllm.sampling_params")
