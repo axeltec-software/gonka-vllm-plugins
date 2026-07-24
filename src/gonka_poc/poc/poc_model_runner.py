@@ -20,7 +20,7 @@ compat.build_common_attention_metadata(...)``. Touchpoints:
 The following vLLM imports REMAIN at module scope because they are public
 (re-exported via the package root):
     * ``vllm.distributed.get_pp_group`` / ``get_tp_group``
-      (pinned by ``tests/contract/test_v0_23_api_surface.py::test_distributed_groups_present``)
+      (pinned by ``tests/contract/test_api_surface.py::test_distributed_groups_present``)
     * ``vllm.distributed.communication_op.broadcast_tensor_dict``
       (pinned by ``::test_communication_op_broadcast``)
     * ``vllm.forward_context.set_forward_context``

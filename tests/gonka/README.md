@@ -16,8 +16,7 @@ server. CPU-only, fast, run on every CI bump. See `tests/unit/` for the
 current set of files — each module docstring says what it covers.
 
 There are also vLLM private-surface drift detectors at
-`tests/contract/test_v0_23_api_surface.py` and
-`tests/contract/test_v0_25_api_surface.py` — they pin the upstream
+`tests/contract/test_api_surface.py` — pins the upstream
 symbols the `gonka_poc._compat.v0_23` and `v0_25` shims depend on (class
 names, dataclass fields, method signatures). Run on every vLLM pin bump.
 

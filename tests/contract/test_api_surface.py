@@ -1,10 +1,20 @@
-"""Drift detector: pin the vLLM 0.25 private surfaces the plugin depends on.
+"""Drift detector: pin the private vLLM surfaces the plugin depends on.
 
 Each test asserts a precise upstream symbol exists with the expected shape
 (class name, dataclass field set, method signature, attribute presence).
-Run on every CI bump of the vllm pin -- a failure here means the compat
-shim ``gonka_poc._compat.v0_25`` needs an update before the plugin can
-target a new vllm minor.
+Run on every CI bump of the vllm pin -- a failure here means the matching
+``gonka_poc._compat`` module needs an update before the plugin can target
+that vllm minor.
+
+One file covers every supported minor. Where upstream moved a symbol
+between minors, the location lives in ``PINS`` below rather than in a
+forked copy of this file: a per-minor copy drifts, and the copy that
+drifts is the one nobody re-reads.
+
+Adding a minor: add its entry to ``PINS`` and a ``_compat/v0_XX.py``. If a
+test needs a genuinely different assertion (not just a different path),
+that is a signal the surface changed shape -- write the branch explicitly
+rather than loosening the assertion.
 
 Scope: read-only inspection of vllm modules; NO GPU, NO engine startup, NO
 forward pass. Safe to run in a vanilla ``pip install vllm`` environment.
@@ -16,16 +26,34 @@ import inspect
 
 import pytest
 
-# Module-level gate: this file pins the 0.25.x surface. Against any other
-# installed vllm minor the pins are EXPECTED to differ -- skip wholesale so
-# the suite is runnable in both 0.23 and 0.25 environments.
+# Per-minor symbol locations. Only entries that actually moved belong here.
+PINS = {
+    "0.23": {
+        # CommonAttentionMetadata lived under the backends helper module...
+        "attention_metadata_module": "vllm.v1.attention.backends.utils",
+    },
+    "0.25": {
+        # ...and was promoted to the backend package root in 0.25.
+        "attention_metadata_module": "vllm.v1.attention.backend",
+    },
+}
+
 _vllm = pytest.importorskip("vllm")
-if not getattr(_vllm, "__version__", "").startswith("0.25."):
+_VERSION = getattr(_vllm, "__version__", "")
+_MINOR = ".".join(_VERSION.split(".")[:2])
+
+# Against an unsupported minor every pin below is EXPECTED to differ, so
+# skip wholesale instead of reporting 20 failures that all mean the same
+# thing: nobody has vetted this minor yet.
+if _MINOR not in PINS:
     pytest.skip(
-        f"vllm {getattr(_vllm, '__version__', '?')} installed; this contract "
-        "file pins 0.25.x (see test_v0_23_api_surface.py for 0.23.x)",
+        f"vllm {_VERSION or '?'} installed; this suite pins "
+        f"{', '.join(sorted(PINS))}. Add an entry to PINS (and a matching "
+        f"_compat module) to support it.",
         allow_module_level=True,
     )
+
+_PINS = PINS[_MINOR]
 
 
 # ---------------------------------------------------------------------------- #
@@ -33,18 +61,16 @@ if not getattr(_vllm, "__version__", "").startswith("0.25."):
 # ---------------------------------------------------------------------------- #
 
 def test_vllm_version_pin() -> None:
-    """This file pins the 0.25.x surface; assert the installed wheel matches."""
+    """The installed wheel must be a minor this suite has pins for."""
     vllm = pytest.importorskip("vllm")
     version = getattr(vllm, "__version__", "")
-    assert version.startswith("0.25."), (
-        f"gonka-poc compat shim targets vllm 0.25.*, got {version!r}. "
-        "Add a new compat module under gonka_poc/_compat/ and update _DISPATCH."
+    minor = ".".join(version.split(".")[:2])
+    assert minor in PINS, (
+        f"gonka-poc targets vllm {', '.join(sorted(PINS))}, got {version!r}. "
+        f"The plugin pin (vllm>=0.23.0,!=0.24.*,<0.26) admits wheels this "
+        f"suite has not vetted."
     )
 
-
-# ---------------------------------------------------------------------------- #
-# CommonAttentionMetadata fields
-# ---------------------------------------------------------------------------- #
 
 def test_common_attention_metadata_fields() -> None:
     """The PoC forward constructs CommonAttentionMetadata directly.
@@ -54,12 +80,12 @@ def test_common_attention_metadata_fields() -> None:
     fields the plugin relies on so a future minor bump fails loudly.
     """
     pytest.importorskip("vllm")
-    mod = importlib.import_module("vllm.v1.attention.backend")
+    mod = importlib.import_module(_PINS["attention_metadata_module"])
     cls = getattr(mod, "CommonAttentionMetadata", None)
     assert cls is not None, (
-        "CommonAttentionMetadata not found at "
-        "vllm.v1.attention.backend (v0.25 canonical declaration site) "
-        "-- compat shim needs update."
+        f"CommonAttentionMetadata not found at "
+        f"{_PINS['attention_metadata_module']} (vllm {_MINOR}) "
+        f"-- compat shim needs update."
     )
 
     # If it's a dataclass / NamedTuple, inspect __annotations__; otherwise
@@ -104,7 +130,7 @@ def test_kv_caches_attribute() -> None:
     cls = getattr(mod, "GPUModelRunner", None)
     assert cls is not None, "GPUModelRunner missing"
     annotations = getattr(cls, "__annotations__", {})
-    # In v0.23 GPUModelRunner.kv_caches is declared as ``list[torch.Tensor]``
+    # GPUModelRunner.kv_caches is declared as ``list[torch.Tensor]``
     # at class scope. If the attribute moves to __init__ only, this check
     # still passes as long as one of the parent class scopes carries it --
     # but the compat shim's getattr-based access still works.
@@ -113,7 +139,7 @@ def test_kv_caches_attribute() -> None:
     # so we just verify it's referenced in the class source).
     src = inspect.getsource(cls)
     assert has_class_annotation or "kv_caches" in src, (
-        "GPUModelRunner.kv_caches not visible in v0.23 source -- "
+        f"GPUModelRunner.kv_caches not visible in vllm {_MINOR} source -- "
         "gonka_poc._compat.v0_25.get_kv_cache_pool needs revision."
     )
 
@@ -317,14 +343,14 @@ def test_cli_args_helpers() -> None:
 
 def test_flexible_argument_parser_import_path() -> None:
     """``FlexibleArgumentParser`` MUST be importable from
-    ``vllm.utils.argparse_utils`` on v0.22+/v0.23.
+    ``vllm.utils.argparse_utils`` since v0.22.
 
     Background: pre-0.22 ``vllm/utils.py`` was a flat module that exported
     ``FlexibleArgumentParser`` directly. In 0.22.0 ``vllm.utils`` became a
     package; the symbol moved to ``vllm.utils.argparse_utils`` and is NOT
     re-exported from the package ``__init__.py``. The legacy import
     ``from vllm.utils import FlexibleArgumentParser`` raises ImportError
-    at runtime (the smoke-help job caught exactly this against the 0.23.0
+    at runtime (the smoke-help job caught exactly this against a real
     pin). ``gonka_poc.entrypoint.api_router.main`` now imports from the
     canonical location with a fallback to the flat path; this contract
     test gives the smoke-help job a symbol-level guard so regressions
@@ -337,15 +363,15 @@ def test_flexible_argument_parser_import_path() -> None:
         "vllm.utils.argparse_utils.FlexibleArgumentParser missing -- "
         "gonka_poc.entrypoint.api_router.main needs revision "
         "(currently falls back to vllm.utils.FlexibleArgumentParser, "
-        "which is also gone in 0.22+/0.23)."
+        "which is gone since 0.22)."
     )
 
 
 def test_cli_env_setup_import_path() -> None:
     """``cli_env_setup`` MUST be importable from
-    ``vllm.entrypoints.serve.utils.api_utils`` on v0.23.
+    ``vllm.entrypoints.serve.utils.api_utils``.
 
-    Background: upstream ``api_server.py:__main__`` (v0.23.0 L697) calls
+    Background: upstream ``api_server.py:__main__`` calls
     ``cli_env_setup()`` before ``uvloop.run`` to set
     ``VLLM_WORKER_MULTIPROC_METHOD=spawn``. Skipping it crashes TP>1 / PP>1
     launches with the classic CUDA-in-forked-process error.
@@ -431,7 +457,7 @@ def test_communication_op_broadcast() -> None:
         "compat shim needs update (fallback: get_tp_group().broadcast_tensor_dict)."
     )
     sig = inspect.signature(fn)
-    # In v0.23 the signature is (tensor_dict=None, src=0). The plugin passes
+    # The signature is (tensor_dict=None, src=0). The plugin passes
     # both positionally; pin the parameter names to catch a kwarg rename.
     params = list(sig.parameters)
     assert params[:2] == ["tensor_dict", "src"], (
@@ -475,7 +501,7 @@ def test_forward_context_set() -> None:
 def test_intermediate_tensors() -> None:
     """PP > 1 PoC may pass / receive IntermediateTensors between stages.
 
-    In v0.23 it lives at ``vllm.sequence.IntermediateTensors`` as a
+    It lives at ``vllm.sequence.IntermediateTensors`` as a
     ``@dataclass`` with a single field ``tensors: dict[str, torch.Tensor]``.
     If a future minor relocates it (likely candidates:
     ``vllm.v1.outputs`` or ``vllm.v1.sequence``), this test fails and the
@@ -504,7 +530,7 @@ def test_intermediate_tensors() -> None:
 def test_launcher_serve_http() -> None:
     """``gonka-vllm-serve`` composition calls ``serve_http`` directly.
 
-    Confirmed at ``vllm.entrypoints.launcher.serve_http`` in v0.23 -- an
+    Confirmed at ``vllm.entrypoints.launcher.serve_http`` -- an
     ``async def`` taking ``(app, sock, enable_ssl_refresh=False, **uvicorn_kwargs)``.
     If a future minor inlines it back into ``api_server`` or renames it to
     ``_serve_http``, this test fires.
@@ -597,12 +623,13 @@ def test_sampling_params_has_fork_patches() -> None:
         assert required in fields, (
             f"SamplingParams.{required} missing despite vllm version {version!r} "
             f"claiming to be the residual wheel — patch regression. Re-check "
-            f"commit 1c5368212 application on poc-sampler-residual-v0.23."
+            f"commit 1c5368212 application on the residual branch for "
+            f"vllm {_MINOR}."
         )
 
 
 # ---------------------------------------------------------------------------- #
-# OpenAIServingChat export (RESTRUCTURED in v0.23)
+# OpenAIServingChat export (restructured in 0.23)
 # ---------------------------------------------------------------------------- #
 
 def test_openai_serving_chat_export() -> None:
@@ -613,7 +640,7 @@ def test_openai_serving_chat_export() -> None:
     pin stays because a relocation of this class signals a restructure of
     the OpenAI entrypoint package that the serve wiring builds on.
 
-    NOTE -- v0.23 restructure: ``vllm.entrypoints.openai.serving_chat`` no
+    NOTE -- 0.23 restructure: ``vllm.entrypoints.openai.serving_chat`` no
     longer exists. The class moved to
     ``vllm.entrypoints.openai.chat_completion.serving.OpenAIServingChat``.
     The ``chat_completion`` package's ``__init__.py`` does NOT re-export

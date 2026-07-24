@@ -18,7 +18,7 @@ v0.23 exposes ``CommonAttentionMetadata`` at TWO paths:
 
 We import from the canonical ``vllm.v1.attention.backends.utils`` path
 because that is the one pinned by
-``tests/contract/test_v0_23_api_surface.py::test_common_attention_metadata_fields``
+``tests/contract/test_api_surface.py::test_common_attention_metadata_fields``
 (the contract test verifies the field set at the declaration site, so the
 shim and the test must reference the same path; otherwise an upstream
 re-export removal would break the shim silently while the contract test
@@ -66,7 +66,7 @@ def build_common_attention_metadata(
     Version constraint: vllm == 0.23.*
 
     Contract test:
-        tests/contract/test_v0_23_api_surface.py::test_common_attention_metadata_fields
+        tests/contract/test_api_surface.py::test_common_attention_metadata_fields
 
     The kwarg list mirrors the fork's ``_create_v1_attn_metadata`` call site at
     ``vllm/poc/poc_model_runner.py`` (branch mb/feat/port-pocv2-vllm-0.23.0):
@@ -150,7 +150,7 @@ def build_attn_metadata_per_group(
     Version constraint: vllm == 0.23.*
 
     Contract test:
-        tests/contract/test_v0_23_api_surface.py::test_kv_caches_attribute
+        tests/contract/test_api_surface.py::test_kv_caches_attribute
         (covers the GPUModelRunner declaration site; attn_groups lives in
         the same class so any reshuffle that breaks one breaks the other)
 
@@ -212,7 +212,7 @@ def get_kv_cache_pool(model_runner: Any) -> list:
     Version constraint: vllm == 0.23.*
 
     Contract test:
-        tests/contract/test_v0_23_api_surface.py::test_kv_caches_attribute
+        tests/contract/test_api_surface.py::test_kv_caches_attribute
 
     The PoC forward reuses blocks starting at index 0 as scratch space; the
     99a372d4e fork commit ("safer kv cache reuse") added dtype/contiguity
@@ -280,7 +280,7 @@ async def abort_all_requests(engine_client: Any) -> int:
     Version constraint: vllm == 0.23.*
 
     Contract test:
-        tests/contract/test_v0_23_api_surface.py::test_engine_client_has_abort
+        tests/contract/test_api_surface.py::test_engine_client_has_abort
 
     Returns: number of requests aborted (best-effort).
 
@@ -391,7 +391,7 @@ def install_engine_core_poc_methods() -> bool:
     Version constraint: vllm == 0.23.*
 
     Contract test:
-        tests/contract/test_v0_23_api_surface.py::test_kv_block_pool_borrow_surface
+        tests/contract/test_api_surface.py::test_kv_block_pool_borrow_surface
     """
     try:
         from vllm.v1.engine.core import EngineCore
