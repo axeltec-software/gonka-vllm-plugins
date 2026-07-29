@@ -27,6 +27,7 @@ test stays green).
 """
 from __future__ import annotations
 
+import inspect
 import logging
 import math
 from typing import Any, Optional
@@ -310,12 +311,34 @@ async def abort_all_requests(engine_client: Any) -> int:
         )
         return 0
 
+    # internal=True is required, not optional: the ids above come from
+    # output_processor.request_states, whose keys are INTERNAL request ids.
+    # With internal=False, abort() looks them up in the external->internal
+    # map, finds nothing, and returns without aborting anything -- silently,
+    # so the counter below still incremented and the log still claimed
+    # success. The EngineClient ABC (vllm/engine/protocol.py:102) declares
+    # abort() without the parameter, so probe rather than assume: a client
+    # that is not AsyncLLM would otherwise raise TypeError on every id.
+    try:
+        supports_internal = "internal" in inspect.signature(abort_fn).parameters
+    except (TypeError, ValueError):  # C-implemented or otherwise uninspectable
+        supports_internal = False
+    if not supports_internal:
+        logger.warning(
+            "abort_all_requests: %s.abort() has no 'internal' parameter; "
+            "aborting by internal id may be a no-op on this client.",
+            type(engine_client).__name__,
+        )
+
     aborted = 0
     for rid in request_ids:
         try:
             # EngineClient.abort accepts a single id or an iterable; we issue
             # per-id calls so one bad id does not abort the rest of the loop.
-            await abort_fn(rid)
+            if supports_internal:
+                await abort_fn(rid, internal=True)
+            else:
+                await abort_fn(rid)
             aborted += 1
         except Exception as exc:  # noqa: BLE001 -- best-effort, never raise
             logger.warning(
