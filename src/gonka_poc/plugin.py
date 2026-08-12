@@ -68,6 +68,8 @@ def register() -> None:
 
     _pkg.PLUGIN_LOADED = True
 
+    _adopt_vllm_logging()
+
     try:
         _install_build_app_warning_wrapper()
     except Exception:  # pragma: no cover
@@ -87,6 +89,26 @@ def register() -> None:
             exc)
 
     _registered = True
+
+
+def _adopt_vllm_logging() -> None:
+    """Route every ``gonka_poc.*`` record through vLLM's log handler.
+
+    vLLM's logging config covers only the ``vllm`` namespace, so plugin
+    records propagate to the root logger, which has no handler: INFO
+    vanishes and WARNING+ comes out bare via ``logging.lastResort``.
+
+    When vLLM's logger has no handlers the operator disabled
+    VLLM_CONFIGURE_LOGGING and owns the logging tree; keep propagating to
+    root rather than second-guessing their setup.
+    """
+    vllm_logger = logging.getLogger("vllm")
+    if not vllm_logger.handlers:
+        return
+    pkg_logger = logging.getLogger("gonka_poc")
+    pkg_logger.handlers = list(vllm_logger.handlers)
+    pkg_logger.setLevel(vllm_logger.level)
+    pkg_logger.propagate = False
 
 
 _build_app_wrapped: bool = False
