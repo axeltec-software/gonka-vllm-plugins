@@ -347,38 +347,6 @@ async def abort_all_requests(engine_client: Any) -> int:
     return aborted
 
 
-def unlock_moe_workspace() -> bool:
-    """Unlock the v0.25 lockable MoE ``WorkspaceManager`` (workspace.py is byte-identical to v0.23; gpu_model_runner still locks at end of capture, :6701 in v0.25.1) so the PoC forward can
-    grow it past the inference-shaped locked size.
-
-    The private ``vllm.v1.worker.workspace`` touchpoint lives here (the only
-    place allowed to reach into ``vllm.v1.*``). Returns ``True`` if a manager
-    was unlocked, ``False`` if there is no active manager (non-MoE model, where
-    ``current_workspace_manager()`` asserts) — the caller then skips the
-    re-lock.
-    """
-    from vllm.v1.worker.workspace import unlock_workspace
-
-    try:
-        unlock_workspace()
-        return True
-    except Exception:  # no MoE workspace manager (non-MoE model)
-        return False
-
-
-def lock_moe_workspace() -> None:
-    """Re-lock the v0.25 MoE ``WorkspaceManager`` after the PoC forward.
-
-    Only called by the context manager when :func:`unlock_moe_workspace`
-    returned ``True`` (so a manager exists); failures are surfaced to the caller.
-    """
-    from vllm.v1.worker.workspace import lock_workspace
-
-    lock_workspace()
-
-
-
-
 # ---------------------------------------------------------------------------- #
 # KV block borrowing (PoC validation without aborting inference)
 # ---------------------------------------------------------------------------- #
@@ -528,8 +496,6 @@ __all__ = [
     "build_attn_metadata_per_group",
     "get_kv_cache_pool",
     "abort_all_requests",
-    "unlock_moe_workspace",
-    "lock_moe_workspace",
     "install_engine_core_poc_methods",
     "borrow_poc_blocks",
     "return_poc_blocks",
