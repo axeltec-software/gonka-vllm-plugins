@@ -44,8 +44,6 @@ CONTRACT WARNINGS:
 """
 from __future__ import annotations
 
-import contextlib
-import logging
 from typing import Any, Dict, List, Optional
 
 # NOTE: keep imports light at module scope -- this file is imported in every
@@ -56,57 +54,6 @@ from typing import Any, Dict, List, Optional
 # it's safe to import at module scope; routing kv_caches access through the
 # shim keeps the documented private-API touchpoint policy honest.
 from gonka_poc._compat import current as _compat_current
-
-logger = logging.getLogger(__name__)
-
-
-@contextlib.contextmanager
-def unlocked_moe_workspace():
-    """Unlock vLLM 0.23's lockable MoE ``WorkspaceManager`` for the duration of
-    the PoC forward, re-locking afterwards.
-
-    vLLM 0.23 sizes the MoE scratch from inference shapes during warmup and
-    LOCKS it (``gpu_model_runner.lock_workspace()``) before the PoC forward ever
-    runs. The PoC forward drives the MoE with a much larger fixed shape, so
-    modular-kernel backends (DeepGEMM, triton) would raise "Workspace is locked
-    but allocation ... requires N MB". Unlocking just around the forward lets it
-    grow once to the PoC high-water-mark (grows-once-then-stays) while leaving
-    inference-shaped traffic on the locked zero-allocation fast path — unlike a
-    global lock bypass, which re-arms the realloc+``empty_cache`` path for ALL
-    traffic and induces caching-allocator churn (the ~10-15% DeepGEMM tax).
-
-    Version-/shape-guarded and no-op when not applicable: vLLM < 0.23 has no
-    ``WorkspaceManager`` (ImportError); non-MoE models have no active manager
-    (``current_workspace_manager()`` asserts) — both fall through cleanly.
-    """
-    # Route the private ``vllm.v1.worker.workspace`` touchpoint through the
-    # version-dispatched compat shim (the only place allowed to reach into
-    # ``vllm.v1.*``). Older shims / non-0.23 vLLM simply lack these attributes.
-    try:
-        compat = _compat_current()
-    except Exception:  # vLLM unavailable or version unmapped — nothing to do
-        compat = None
-    unlock = getattr(compat, "unlock_moe_workspace", None)
-    lock = getattr(compat, "lock_moe_workspace", None)
-
-    unlocked = False
-    if callable(unlock) and callable(lock):
-        try:
-            unlocked = bool(unlock())
-        except Exception:  # defensive — never let workspace management crash PoC
-            logger.debug("gonka_poc: MoE workspace unlock unavailable for the PoC forward")
-
-    try:
-        yield
-    finally:
-        if unlocked:
-            try:
-                lock()
-            except Exception:  # leaving it unlocked is functionally safe (can still grow)
-                logger.warning(
-                    "gonka_poc: failed to re-lock the MoE workspace after the PoC forward"
-                )
-
 
 class PoCWorkerExtension:
     """Add-only methods reachable from ``collective_rpc``.
@@ -172,26 +119,22 @@ class PoCWorkerExtension:
         # hard-fails in gonka_poc._compat, so no fallback is needed.
         hidden_size = int(self.vllm_config.model_config.get_hidden_size())
 
-        # Unlock the vLLM 0.23 lockable MoE workspace around the PoC forward so
-        # the larger PoC MoE shape can grow it once, then re-lock (see
-        # ``unlocked_moe_workspace`` for the full rationale / DeepGEMM tax).
-        with unlocked_moe_workspace():
-            result = _execute_poc_forward(
-                self,  # the live Worker; matches the ``worker`` param in poc_model_runner
-                block_hash,
-                public_key,
-                list(nonces),
-                int(seq_len),
-                int(hidden_size),
-                k_dim=int(k_dim) if k_dim is not None else DEFAULT_K_DIM,
-                poc_stronger_rng=bool(poc_stronger_rng),
-                borrowed_block_ids=(
-                    list(borrowed_block_ids)
-                    if borrowed_block_ids is not None else None),
-                borrowed_stripe=(
-                    int(borrowed_stripe)
-                    if borrowed_stripe is not None else None),
-            )
+        result = _execute_poc_forward(
+            self,  # the live Worker; matches the ``worker`` param in poc_model_runner
+            block_hash,
+            public_key,
+            list(nonces),
+            int(seq_len),
+            int(hidden_size),
+            k_dim=int(k_dim) if k_dim is not None else DEFAULT_K_DIM,
+            poc_stronger_rng=bool(poc_stronger_rng),
+            borrowed_block_ids=(
+                list(borrowed_block_ids)
+                if borrowed_block_ids is not None else None),
+            borrowed_stripe=(
+                int(borrowed_stripe)
+                if borrowed_stripe is not None else None),
+        )
 
         rank = int(getattr(self, "rank", -1))
 
