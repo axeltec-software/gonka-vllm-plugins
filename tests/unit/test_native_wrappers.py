@@ -68,7 +68,7 @@ def test_attach_discovery_and_idempotence():
     st = attach_native_poc(m, H, max_rows=8, device=torch.device("cpu"),
                            dtype=torch.float32, route_window=256)
     assert len(st.router_meta) == 2 and st.router_meta[0] == (16, 2)
-    assert all(getattr(l.moe, "_poc_gate_patched", False)
+    assert all(hasattr(l.moe.gate, "_poc_state")
                for l in m.model.layers)
     again = attach_native_poc(m, H, 8, torch.device("cpu"),
                               torch.float32, 256)

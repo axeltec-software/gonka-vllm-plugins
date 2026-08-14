@@ -239,30 +239,35 @@ def attach_native_poc(model: nn.Module, hidden_size: int, max_rows: int,
 
 
 def _patch_embed_forward(emb: nn.Module, state: "PoCNativeState"):
-    """Swap embedding rows for staged synthetic embeds on PoC rows.
+    """CLASS-level forward patch: dynamo inlines ``type(mod).forward`` and
+    IGNORES instance monkeypatches (verified: instance-patched graphs carried
+    none of the PoC transforms), so every patch here goes on the class and
+    reads per-instance state attributes (dynamo specializes on them)."""
+    cls = type(emb)
+    if not getattr(cls, "_poc_class_patched", False):
+        orig = cls.forward
 
-    Lets the PoC loop call the model with the ENGINE signature (input_ids
-    tensor, inputs_embeds None) so the ``@support_torch_compile`` path is
-    taken; with the mask all-zero this is an exact identity for chat.
-    """
-    orig = emb.forward
+        def forward(self, input_ids):
+            out = orig(self, input_ids)
+            st = getattr(self, "_poc_state", None)
+            if st is None:
+                return out
+            n = out.shape[0]
+            mask = st.mask
+            if n > mask.shape[0]:
+                return out  # chat batch beyond PoC buffers: untouched
+            return torch.where(mask[:n], st.embeds[:n].to(out.dtype), out)
 
-    def forward(input_ids):
-        out = orig(input_ids)
-        n = out.shape[0]
-        mask = state.mask
-        if n > mask.shape[0]:
-            return out  # chat batch beyond PoC buffers: untouched
-        return torch.where(mask[:n], state.embeds[:n].to(out.dtype), out)
-
-    emb.forward = forward
+        cls.forward = forward
+        cls._poc_class_patched = True
+    emb._poc_state = state
 
 
 def _find_layer_moe(layer: nn.Module):
     return next(
         (m for m in layer.modules()
          if hasattr(m, "gate") and hasattr(m, "experts")
-         and not getattr(m, "_poc_gate_patched", False)),
+         and not hasattr(getattr(m, "gate"), "_poc_state")),
         None)
 
 
@@ -296,49 +301,72 @@ def _moe_dims(moe: nn.Module, hf_config) -> Optional[tuple]:
 
 
 def _patch_layer_forward(layer: nn.Module, state: "PoCNativeState", li: int):
-    """Reflect the layer's (hidden, residual) output on PoC rows, in place."""
-    orig = layer.forward
+    """Reflect the layer's (hidden, residual) output on PoC rows.
 
-    def forward(*args, **kwargs):
-        out = orig(*args, **kwargs)
-        vbuf, mask = state.vectors[li], state.mask
-        first = out[0] if isinstance(out, tuple) else out
-        if first.shape[0] > mask.shape[0]:
-            return out  # chat batch beyond PoC buffers: untouched (shape guard)
-        if isinstance(out, tuple) and len(out) == 2:
-            hidden, residual = out
+    Class-level patch (see _patch_embed_forward); per-layer index and state
+    live on the instance.
+    """
+    cls = type(layer)
+    if not getattr(cls, "_poc_class_patched", False):
+        orig = cls.forward
+
+        def forward(self, *args, **kwargs):
+            out = orig(self, *args, **kwargs)
+            st = getattr(self, "_poc_state", None)
+            if st is None:
+                return out
+            vbuf, mask = st.vectors[self._poc_li], st.mask
+            first = out[0] if isinstance(out, tuple) else out
+            if first.shape[0] > mask.shape[0]:
+                return out  # chat batch beyond PoC buffers: untouched
+            if isinstance(out, tuple) and len(out) == 2:
+                hidden, residual = out
+                n = hidden.shape[0]
+                hidden = _reflect(hidden, vbuf, mask[:n])
+                if residual is not None:
+                    residual = _reflect(residual, vbuf, mask[:n])
+                return hidden, residual
+            hidden = first
             n = hidden.shape[0]
             hidden = _reflect(hidden, vbuf, mask[:n])
-            if residual is not None:
-                residual = _reflect(residual, vbuf, mask[:n])
-            return hidden, residual
-        hidden = out[0] if isinstance(out, tuple) else out
-        n = hidden.shape[0]
-        hidden = _reflect(hidden, vbuf, mask[:n])
-        return (hidden, *out[1:]) if isinstance(out, tuple) else hidden
+            return (hidden, *out[1:]) if isinstance(out, tuple) else hidden
 
-    layer.forward = forward
+        cls.forward = forward
+        cls._poc_class_patched = True
+    layer._poc_state = state
+    layer._poc_li = li
 
 
 def _patch_gate_forward(moe: nn.Module, state: "PoCNativeState",
                         route_base: torch.Tensor, n_experts: int, top_k: int):
-    """Override the MoE gate's logits with seeded logits on PoC rows."""
+    """Override the MoE gate's logits with seeded logits on PoC rows.
+
+    Class-level patch (see _patch_embed_forward); the per-gate route-base
+    buffer and dims live on the gate instance.
+    """
     gate = moe.gate
-    orig = gate.forward
-    step_buf = state.route_step
-    mask = state.mask
+    cls = type(gate)
+    if not getattr(cls, "_poc_class_patched", False):
+        orig = cls.forward
 
-    def forward(*args, **kwargs):
-        out = orig(*args, **kwargs)
-        logits = out[0] if isinstance(out, tuple) else out
-        n = logits.shape[0]
-        if n > mask.shape[0]:
-            return out  # chat batch beyond PoC buffers: untouched
-        forced = expert_logits_from_base(
-            route_base[:n], step_buf[:n], n_experts, top_k,
-            logits.device).to(logits.dtype)
-        logits = torch.where(mask[:n], forced, logits)
-        return (logits, *out[1:]) if isinstance(out, tuple) else logits
+        def forward(self, *args, **kwargs):
+            out = orig(self, *args, **kwargs)
+            st = getattr(self, "_poc_state", None)
+            if st is None:
+                return out
+            logits = out[0] if isinstance(out, tuple) else out
+            n = logits.shape[0]
+            if n > st.mask.shape[0]:
+                return out  # chat batch beyond PoC buffers: untouched
+            ne, tk = self._poc_dims
+            forced = expert_logits_from_base(
+                self._poc_base[:n], st.route_step[:n], ne, tk,
+                logits.device).to(logits.dtype)
+            logits = torch.where(st.mask[:n], forced, logits)
+            return (logits, *out[1:]) if isinstance(out, tuple) else logits
 
-    gate.forward = forward
-    moe._poc_gate_patched = True
+        cls.forward = forward
+        cls._poc_class_patched = True
+    gate._poc_state = state
+    gate._poc_base = route_base
+    gate._poc_dims = (int(n_experts), int(top_k))
