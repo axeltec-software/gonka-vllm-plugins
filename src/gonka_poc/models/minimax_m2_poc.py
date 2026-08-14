@@ -24,14 +24,23 @@ POC_ROUTE_WINDOW_DEFAULT = int(os.environ.get("POC_ROUTE_WINDOW", "256"))
 
 
 class MiniMaxM2ForCausalLMPoC(MiniMaxM2ForCausalLM):
+    """Wrappers attach at the END of load_weights: after the checkpoint is
+    mapped (wrapping earlier renames parameters to ``layers.N.inner.*`` and
+    breaks weight loading) and before the first forward (vLLM compiles the
+    forward lazily on first call — so the compiled graph still contains the
+    wrappers, the 0.20 bit path)."""
 
-    def __init__(self, *, vllm_config, prefix: str = ""):
-        super().__init__(vllm_config=vllm_config, prefix=prefix)
-        hidden = int(vllm_config.model_config.get_hidden_size())
+    def load_weights(self, weights):
+        out = super().load_weights(weights)
+        vllm_config = getattr(self, "vllm_config", None)
+        hidden = (int(vllm_config.model_config.get_hidden_size())
+                  if vllm_config is not None else
+                  int(self.config.hidden_size))
         try:
-            device = next(self.parameters()).device
-            dtype = next(self.parameters()).dtype
+            p = next(self.parameters())
+            device, dtype = p.device, p.dtype
         except StopIteration:  # pragma: no cover
             device, dtype = torch.device("cuda"), torch.bfloat16
         attach_native_poc(self, hidden, POC_NATIVE_MAX_ROWS, device, dtype,
                           POC_ROUTE_WINDOW_DEFAULT)
+        return out
