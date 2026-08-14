@@ -20,7 +20,11 @@ from gonka_poc.poc.native import attach_native_poc
 
 # Buffer cap: prefill rows of the largest decode chunk (nonces * seq_len).
 POC_NATIVE_MAX_ROWS = int(os.environ.get("POC_NATIVE_MAX_ROWS", str(128 * 256)))
-POC_ROUTE_WINDOW_DEFAULT = int(os.environ.get("POC_ROUTE_WINDOW", "256"))
+# 0.20 engine default (poc_route_window=16). PROCESS constant: the window is
+# baked into the compiled graph at first compilation (dynamo freezes the
+# global) — request-time switching is impossible by construction, exactly
+# like the 0.20 engine arg. Change via env before start, never per request.
+POC_ROUTE_WINDOW_DEFAULT = int(os.environ.get("POC_ROUTE_WINDOW", "16"))
 
 
 class MiniMaxM2ForCausalLMPoC(MiniMaxM2ForCausalLM):

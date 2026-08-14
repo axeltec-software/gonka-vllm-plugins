@@ -139,9 +139,15 @@ def execute_poc_decode(
         max_rows = POC_DECODE_PREFILL_CHUNK * seq_len
         state = attach_native_poc(model, hidden_size, max_rows, device, dtype,
                                   route_window)
-    else:
-        from .gpu_random import set_route_window
-        set_route_window(route_window)
+    elif int(route_window) != int(getattr(state, "route_window", route_window)):
+        # The window is frozen into the compiled graph at first compilation
+        # (0.20 semantics: an engine arg, not a request knob) — a mismatched
+        # request must fail loud, silently serving the frozen window would
+        # produce consensus-invalid artifacts.
+        raise ValueError(
+            f"route_window={route_window} requested but the process was "
+            f"compiled with {state.route_window}; set POC_ROUTE_WINDOW and "
+            f"restart")
     if per_nonce_reflection:
         raise NotImplementedError(
             "per_nonce_reflection: per-row reflection buffers deferred "

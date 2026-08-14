@@ -206,6 +206,7 @@ def attach_native_poc(model: nn.Module, hidden_size: int, max_rows: int,
     owner = _find_decoder_layers(model)
     layers = list(owner.layers)
     state = PoCNativeState(len(layers), hidden_size, max_rows, device, dtype)
+    state.route_window = int(route_window)
 
     emb = getattr(owner, "embed_tokens", None)
     if emb is not None:
