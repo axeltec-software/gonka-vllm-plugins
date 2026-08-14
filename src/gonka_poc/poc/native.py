@@ -230,17 +230,23 @@ class PoCNativeState:
         self._rows_key = None
 
 
-def _find_decoder_layers(model: nn.Module) -> List[nn.Module]:
-    """Locate the decoder layer list generically (`.layers` ModuleList on the
-    deepest submodule that has one)."""
-    found = None
-    for m in model.modules():
+def _find_decoder_layers(model: nn.Module) -> nn.Module:
+    """Locate the decoder layer owner generically: the module whose ``.layers``
+    ModuleList is the LONGEST one in the tree (the transformer stack). The
+    previous "deepest" heuristic could latch onto a nested short list (seen on
+    MiniMax-M2.7: 28 inner modules wrapped instead of the 62 decoder layers,
+    which also left every MoE gate undiscovered)."""
+    best, best_name = None, None
+    for name, m in model.named_modules():
         layers = getattr(m, "layers", None)
-        if isinstance(layers, nn.ModuleList) and len(layers) > 0:
-            found = m
-    if found is None:
+        if isinstance(layers, nn.ModuleList) and (
+                best is None or len(layers) > len(best.layers)):
+            best, best_name = m, name
+    if best is None:
         raise RuntimeError("PoC native: no decoder .layers ModuleList found")
-    return found
+    logger.info("PoC native: decoder stack at '%s' (%d layers)",
+                best_name or "<root>", len(best.layers))
+    return best
 
 
 def attach_native_poc(model: nn.Module, hidden_size: int, max_rows: int,
