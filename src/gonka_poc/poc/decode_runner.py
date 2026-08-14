@@ -59,6 +59,12 @@ _SKIP_COMPILED = os.environ.get("POC_DECODE_SKIP_COMPILED", "0") == "1"
 # Per-step wall-clock breakdown (metadata/embeds/forward/snap) logged once per
 # chunk; costs one cuda sync per step — diagnostics only, keep off in prod.
 _PROFILE = os.environ.get("POC_DECODE_PROFILE", "0") == "1"
+# Capture the decode-step forward into a private CUDA graph and replay it:
+# the step is launch-bound (profile: forward 98% at ~55ms/step, hundreds of
+# kernel launches through the compiled runner), the graph replays the same
+# kernels at the same addresses. Bit-neutral by construction; the ladder
+# (self-validation + golden tau-gate) re-verifies after every perf change.
+_CAPTURE = os.environ.get("POC_DECODE_CAPTURE", "1") == "1"
 POC_DECODE_PREFILL_CHUNK = int(os.environ.get("POC_DECODE_PREFILL_CHUNK", "128"))
 
 
@@ -239,6 +245,18 @@ def execute_poc_decode(
     positions_step = torch.empty(batch, dtype=torch.int64, device=device)
     steps_t = torch.empty(batch, dtype=torch.int64, device=device)
     ids_step = torch.zeros(batch, dtype=torch.int64, device=device)
+    # Graph state: captured on step 1 after a warmup call; replayed for the
+    # remaining steps. All tensors the captured kernels read live at stable
+    # addresses: positions/ids/steps (ours), state buffers (embeds, mask,
+    # route), the builder's persistent cudagraph plan buffers, and
+    # ``stable_slots`` — per-group clones the forward context carried at
+    # capture time, refreshed with copy_ each step (borrowed layouts are not
+    # arithmetic in the step index, so copy_, never add_).
+    graph = None
+    g_hidden = None
+    stable_slots: Optional[Dict[str, torch.Tensor]] = None
+    slot_pairs: List[tuple] = []   # (stable_group_tensor, representative layer)
+    capture_wanted = _CAPTURE and not _PROFILE
     prof = [0.0, 0.0, 0.0, 0.0] if _PROFILE else None  # meta/embeds/fwd/snap
     for t in range(1, max_tokens + 1):
         if prof is not None:
@@ -262,11 +280,52 @@ def execute_poc_decode(
         state.set_rows(block_hash, batch)
         state.set_routing(block_hash, nonces, 1, t)
         state.set_embeds(embeds_t)
-        with set_forward_context(attn_t, vllm_config, num_tokens=batch,
-                                 slot_mapping=slots_t,
-                                 skip_compiled=_SKIP_COMPILED):
-            h = model(input_ids=ids_step, positions=positions_step,
-                      intermediate_tensors=None, inputs_embeds=None)
+        if graph is not None:
+            for buf, name in slot_pairs:
+                buf.copy_(slots_t[name])
+            graph.replay()
+            h = g_hidden
+        else:
+            if capture_wanted and t == 1:
+                # Unique per-group slot tensors -> stable clones; every layer
+                # of a group shares one tensor, keep that sharing.
+                uniq: Dict[int, torch.Tensor] = {}
+                stable_slots = {}
+                for name, src in slots_t.items():
+                    key = src.data_ptr()
+                    if key not in uniq:
+                        uniq[key] = src.clone()
+                        slot_pairs.append((uniq[key], name))
+                    stable_slots[name] = uniq[key]
+                slots_for_ctx = stable_slots
+            else:
+                slots_for_ctx = slots_t
+            with set_forward_context(attn_t, vllm_config, num_tokens=batch,
+                                     slot_mapping=slots_for_ctx,
+                                     skip_compiled=_SKIP_COMPILED):
+                h = model(input_ids=ids_step, positions=positions_step,
+                          intermediate_tensors=None, inputs_embeds=None)
+                if capture_wanted and t == 1:
+                    # Same inputs, same KV slot: re-running step 1 during
+                    # capture is idempotent (writes the same bytes).
+                    try:
+                        graph = torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(graph):
+                            g_hidden = model(input_ids=ids_step,
+                                             positions=positions_step,
+                                             intermediate_tensors=None,
+                                             inputs_embeds=None)
+                        if isinstance(g_hidden, tuple):
+                            g_hidden = g_hidden[0]
+                        h = g_hidden
+                        logger.info("PoC decode: step graph captured "
+                                    "(batch %d)", batch)
+                    except Exception:
+                        logger.exception(
+                            "PoC decode: step-graph capture failed; falling "
+                            "back to per-step compiled calls")
+                        graph = None
+                        g_hidden = None
         if isinstance(h, tuple):
             h = h[0]
         if prof is not None:
