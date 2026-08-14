@@ -59,6 +59,17 @@ def register() -> None:
     if _registered:
         return
 
+    # PoC-wrapped model classes: registered FIRST so the engine compiles the
+    # wrapped module (transforms inside the compiled graph — 0.20 bit path).
+    try:
+        from vllm import ModelRegistry
+        ModelRegistry.register_model(
+            "MiniMaxM2ForCausalLM",
+            "gonka_poc.models.minimax_m2_poc:MiniMaxM2ForCausalLMPoC")
+        logger.info("gonka_poc: MiniMaxM2ForCausalLM overridden with PoC-wrapped class")
+    except Exception:  # pragma: no cover — non-vllm import contexts
+        logger.exception("gonka_poc: model registry override failed")
+
     # Expose a process-local flag so the gate-presence check in
     # ``gonka_poc.entrypoint.gating.PoCGatingMiddleware`` can detect "plugin
     # loaded but no gate attached" (operator likely ran plain ``vllm serve``

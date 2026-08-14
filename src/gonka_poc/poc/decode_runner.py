@@ -52,6 +52,9 @@ from .native import attach_native_poc
 logger = logging.getLogger(__name__)
 
 _MARGIN_TAU = float(os.environ.get("VLLM_POC_MARGIN_TAU", "0") or "0")
+# Compiled path is the default (0.20 bit reference); eager only as a debug
+# fallback behind the flag (migration rule: eager is not an execution mode).
+_SKIP_COMPILED = os.environ.get("POC_DECODE_SKIP_COMPILED", "0") == "1"
 POC_DECODE_PREFILL_CHUNK = int(os.environ.get("POC_DECODE_PREFILL_CHUNK", "128"))
 
 
@@ -126,12 +129,19 @@ def execute_poc_decode(
     if pp_group.world_size > 1:
         raise RuntimeError("decode-PoC: PP > 1 not supported in this revision")
 
-    # --- model wrappers (idempotent), route window pushed ------------------
-    # Buffers are allocated once at the CHUNK MAXIMUM (prefill rows of the
-    # largest allowed chunk), so a later bigger chunk never outgrows them.
-    max_rows = POC_DECODE_PREFILL_CHUNK * seq_len
-    state = attach_native_poc(model, hidden_size, max_rows, device, dtype,
-                              route_window)
+    # --- model wrappers: pre-compile (registry class) or late attach -------
+    # The registry-wrapped model carries state from construction (wrappers are
+    # INSIDE the compiled graph — 0.20 bit path). Late attach remains as a
+    # fallback for unregistered architectures; its wrappers are only seen by
+    # the eager path.
+    state = getattr(model, "_poc_native_state", None)
+    if state is None:
+        max_rows = POC_DECODE_PREFILL_CHUNK * seq_len
+        state = attach_native_poc(model, hidden_size, max_rows, device, dtype,
+                                  route_window)
+    else:
+        from .gpu_random import set_route_window
+        set_route_window(route_window)
     if per_nonce_reflection:
         raise NotImplementedError(
             "per_nonce_reflection: per-row reflection buffers deferred "
@@ -195,7 +205,7 @@ def execute_poc_decode(
     with set_forward_context(attn_pf, vllm_config,
                              num_tokens=batch * seq_len,
                              slot_mapping=slots_pf,
-                             skip_compiled=True):
+                             skip_compiled=_SKIP_COMPILED):
         hidden = model(input_ids=None, positions=positions_pf,
                        intermediate_tensors=None,
                        inputs_embeds=embeds_pf.view(-1, hidden_size))
@@ -223,7 +233,8 @@ def execute_poc_decode(
         state.set_rows(block_hash, batch)
         state.set_routing(block_hash, nonces, 1, t)
         with set_forward_context(attn_t, vllm_config, num_tokens=batch,
-                                 slot_mapping=slots_t, skip_compiled=True):
+                                 slot_mapping=slots_t,
+                                 skip_compiled=_SKIP_COMPILED):
             h = model(input_ids=None, positions=positions_step,
                       intermediate_tensors=None, inputs_embeds=embeds_t)
         if isinstance(h, tuple):
