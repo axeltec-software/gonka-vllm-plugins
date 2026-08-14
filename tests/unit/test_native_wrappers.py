@@ -82,7 +82,7 @@ def test_layer_wrapper_reflects_poc_rows():
     m = FakeModel()
     st = attach_native_poc(m, H, 4, torch.device("cpu"), torch.float32, 256)
     bh = "deadbeef" * 8
-    st.set_rows([bh, None, bh, None], [None] * 4)
+    st.set_rows(bh, 2)  # first 2 rows PoC
     x = torch.randn(4, H)
     out, _ = m.model.layers[0](x, None)
     base = x + 1.0
@@ -90,15 +90,15 @@ def test_layer_wrapper_reflects_poc_rows():
         f"{bh}_layer_0_householder", H, torch.device("cpu"))
     expect0 = base[0] - 2.0 * (base[0] @ v) * v
     assert torch.allclose(out[0], expect0, atol=1e-6)
-    assert torch.equal(out[1], base[1])          # non-PoC row untouched
+    assert torch.equal(out[2], base[2])          # row beyond n_rows untouched
 
 
 def test_router_wrapper_forces_seeded_logits():
     m = FakeModel()
     st = attach_native_poc(m, H, 4, torch.device("cpu"), torch.float32, 256)
     bh = "deadbeef" * 8
-    st.set_rows([bh] * 4, [None] * 4)
-    st.set_routing([bh] * 4, [0, 1, 2, 3], [5] * 4)
+    st.set_rows(bh, 4)
+    st.set_routing(bh, [0, 1, 2, 3], 1, 5)
     x = torch.randn(4, H)
     logits = m.model.layers[0].inner.moe(x)
     # expected: seeded logits for (bh, nonce, step=5, layer=0)
@@ -110,11 +110,9 @@ def test_router_wrapper_forces_seeded_logits():
                            torch.sort(exp).values), f"row {row}"
 
 
-def test_per_nonce_reflection_changes_vectors():
+def test_per_nonce_reflection_guarded():
     m = FakeModel()
     st = attach_native_poc(m, H, 2, torch.device("cpu"), torch.float32, 256)
-    bh = "deadbeef" * 8
-    st.set_rows([bh, bh], [7, None])
-    x = torch.randn(2, H)
-    out, _ = m.model.layers[0](x, None)
-    assert not torch.allclose(out[0], out[1] - (x[1] - x[0]) - 1.0 + 1.0)
+    import pytest as _pt
+    with _pt.raises(NotImplementedError):
+        st.set_rows("deadbeef" * 8, 2, per_nonce=True)

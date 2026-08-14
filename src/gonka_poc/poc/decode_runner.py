@@ -127,10 +127,15 @@ def execute_poc_decode(
         raise RuntimeError("decode-PoC: PP > 1 not supported in this revision")
 
     # --- model wrappers (idempotent), route window pushed ------------------
-    max_rows = max(batch * seq_len, batch)
+    # Buffers are allocated once at the CHUNK MAXIMUM (prefill rows of the
+    # largest allowed chunk), so a later bigger chunk never outgrows them.
+    max_rows = POC_DECODE_PREFILL_CHUNK * seq_len
     state = attach_native_poc(model, hidden_size, max_rows, device, dtype,
                               route_window)
-    refl = [n if per_nonce_reflection else None for n in nonces]
+    if per_nonce_reflection:
+        raise NotImplementedError(
+            "per_nonce_reflection: per-row reflection buffers deferred "
+            "(golden scope: off)")
 
     # --- chain state (address-stable, capture-ready) ------------------------
     codebook = get_sphere_codebook().to(device=device)
@@ -184,11 +189,8 @@ def execute_poc_decode(
                                 dim=hidden_size, seq_len=seq_len,
                                 device=device, dtype=dtype)
 
-    state.set_rows([block_hash] * (batch * seq_len),
-                   [rn for rn in refl for _ in range(seq_len)])
-    state.set_routing([block_hash] * (batch * seq_len),
-                      [n for n in nonces for _ in range(seq_len)],
-                      [0] * (batch * seq_len))
+    state.set_rows(block_hash, batch * seq_len)
+    state.set_routing(block_hash, nonces, seq_len, 0)
 
     with set_forward_context(attn_pf, vllm_config,
                              num_tokens=batch * seq_len,
@@ -218,8 +220,8 @@ def execute_poc_decode(
             borrowed_block_ids=borrowed_block_ids,
             borrowed_stripe=borrowed_stripe,
             alloc_len=alloc_len, decode_step=seq_len + t - 1)
-        state.set_rows([block_hash] * batch, refl)
-        state.set_routing([block_hash] * batch, list(nonces), [t] * batch)
+        state.set_rows(block_hash, batch)
+        state.set_routing(block_hash, nonces, 1, t)
         with set_forward_context(attn_t, vllm_config, num_tokens=batch,
                                  slot_mapping=slots_t, skip_compiled=True):
             h = model(input_ids=None, positions=positions_step,

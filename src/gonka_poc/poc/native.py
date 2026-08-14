@@ -139,8 +139,13 @@ class PoCNativeState:
         self.hidden_size = hidden_size
         self.max_rows = max_rows
         self.device = device
+        # Reflection vectors are BROADCAST [1, hidden]: one chunk carries one
+        # block_hash, so a per-token-row [rows, hidden] buffer (12+ GiB at the
+        # 128-nonce prefill chunk) is pure waste. per_nonce_reflection would
+        # need per-row vectors — deferred (not in the golden scope), guarded
+        # in set_rows.
         self.vectors: List[torch.Tensor] = [
-            torch.zeros(max_rows, hidden_size, device=device, dtype=dtype)
+            torch.zeros(1, hidden_size, device=device, dtype=dtype)
             for _ in range(num_layers)
         ]
         self.mask = torch.zeros(max_rows, 1, device=device, dtype=torch.bool)
@@ -168,62 +173,56 @@ class PoCNativeState:
             self._hh_cache[key] = vs
         return vs
 
-    def set_rows(self, row_hashes: List[Optional[str]],
-                 row_refl_nonces: List[Optional[int]]) -> None:
-        """Fill per-row reflection vectors + PoC mask for the next forward.
+    def set_rows(self, block_hash: Optional[str], n_rows: int,
+                 refl_nonce: Optional[int] = None,
+                 per_nonce: bool = False) -> None:
+        """Broadcast reflection vectors for ONE block_hash + mask first n_rows.
 
-        0.20: set_row_block_hashes. row_hashes[i] is None for non-PoC rows
-        (mask False, vector zero -> wrapper is exact identity).
+        block_hash None -> full identity (mask off). per_nonce reflection needs
+        per-row vectors — not implemented in this revision (golden scope has it
+        off); fail loud rather than silently mis-derive.
         """
-        key = (tuple(row_hashes), tuple(row_refl_nonces))
+        if per_nonce:
+            raise NotImplementedError(
+                "per_nonce_reflection needs per-row reflection buffers; "
+                "excluded from this revision (golden scope: off)")
+        key = (block_hash, refl_nonce, n_rows)
         if key == self._rows_key:
             return
-        n = len(row_hashes)
-        mask_host = torch.tensor(
-            [h is not None for h in row_hashes], dtype=torch.bool
-        ).unsqueeze(-1)
-        self.mask[:n].copy_(mask_host.to(self.device))
-        if n < self.max_rows:
-            self.mask[n:].zero_()
-        dtype = self.vectors[0].dtype
-        for li in range(self.num_layers):
-            buf = self.vectors[li]
-            rows = []
-            for bh, nz in zip(row_hashes, row_refl_nonces):
-                if bh is None:
-                    rows.append(torch.zeros(self.hidden_size, device=self.device,
-                                            dtype=dtype))
-                else:
-                    rows.append(self._hh_vectors(bh, nz, dtype)[li])
-            buf[:n].copy_(torch.stack(rows))
+        if block_hash is None:
+            self.mask.zero_()
+        else:
+            self.mask[:n_rows].fill_(True)
+            self.mask[n_rows:].zero_()
+            dtype = self.vectors[0].dtype
+            vs = self._hh_vectors(block_hash, refl_nonce, dtype)
+            for li in range(self.num_layers):
+                self.vectors[li].copy_(vs[li].unsqueeze(0))
         self._rows_key = key
 
     # -- seeded routing ----------------------------------------------------
-    def set_routing(self, row_hashes: List[Optional[str]],
-                    row_nonces: List[Optional[int]],
-                    row_steps: List[int]) -> None:
-        """Refresh per-row seeded-router state (0.20: set_routing).
+    def set_routing(self, block_hash: str, nonces: List[int],
+                    tokens_per_nonce: int, step: int) -> None:
+        """Refresh seeded-router state for one chunk.
 
-        Base seed sha256 is hashed once per (hash, nonce, layer) mapping and
-        cached in the per-layer [max_rows] buffers; the step folds in on-GPU
-        inside the wrapper. Rows with hash None get base 0 (masked out).
+        Row layout: nonce-major, ``tokens_per_nonce`` consecutive rows per
+        nonce (prefill: seq_len rows/nonce, decode step: 1 row/nonce). Base
+        seed sha256 is hashed once per (hash, nonce, layer) and expanded on
+        device; the step folds in on-GPU inside the wrapper.
         """
         if not self._route_base:
             return
-        base_key = (tuple(row_hashes), tuple(row_nonces))
-        n = len(row_steps)
+        n = len(nonces) * tokens_per_nonce
+        base_key = (block_hash, tuple(nonces), tokens_per_nonce)
         if base_key != self._route_key:
             for li, buf in enumerate(self._route_base):
-                vals = [
-                    _seed_from_string(route_base_seed(bh, nz, li))
-                    if bh is not None else 0
-                    for bh, nz in zip(row_hashes, row_nonces)
-                ]
-                buf[:n].copy_(torch.tensor(vals, dtype=torch.int64,
-                                           device=self.device))
+                vals = torch.tensor(
+                    [_seed_from_string(route_base_seed(block_hash, nz, li))
+                     for nz in nonces],
+                    dtype=torch.int64, device=self.device)
+                buf[:n].copy_(vals.repeat_interleave(tokens_per_nonce))
             self._route_key = base_key
-        self.route_step[:n].copy_(torch.tensor(row_steps, dtype=torch.int64,
-                                               device=self.device))
+        self.route_step[:n].fill_(int(step))
 
     def clear(self) -> None:
         """Identity for everything (defensive; engine paths never see us)."""

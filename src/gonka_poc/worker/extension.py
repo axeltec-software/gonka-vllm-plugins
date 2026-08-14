@@ -44,6 +44,10 @@ CONTRACT WARNINGS:
 """
 from __future__ import annotations
 
+logger = logging.getLogger(__name__)
+
+import logging
+
 from typing import Any, Dict, List, Optional
 
 # NOTE: keep imports light at module scope -- this file is imported in every
