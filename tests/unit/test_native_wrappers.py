@@ -53,6 +53,7 @@ class FakeLayer(nn.Module):
 class FakeCore(nn.Module):
     def __init__(self, n_layers=2):
         super().__init__()
+        self.embed_tokens = nn.Embedding(64, H)
         self.layers = nn.ModuleList(FakeLayer() for _ in range(n_layers))
 
 
@@ -121,3 +122,23 @@ def test_per_nonce_reflection_guarded():
     import pytest as _pt
     with _pt.raises(NotImplementedError):
         st.set_rows("deadbeef" * 8, 2, per_nonce=True)
+
+
+def test_embed_patch_swaps_poc_rows_and_stays_identity_for_chat():
+    m = FakeModel()
+    st = attach_native_poc(m, H, 4, torch.device("cpu"), torch.float32, 256)
+    assert st.has_embed_patch
+    ids = torch.arange(4)
+    plain = nn.Embedding(64, H)
+    plain.load_state_dict(m.model.embed_tokens.state_dict())
+    st.clear()
+    out = m.model.embed_tokens(ids)
+    assert torch.equal(out, plain(ids))          # mask off -> exact identity
+    synth = torch.randn(2, H)
+    st.set_rows("deadbeef" * 8, 2)
+    st.set_embeds(synth)
+    out = m.model.embed_tokens(ids)
+    assert torch.equal(out[:2], synth)           # PoC rows swapped
+    assert torch.equal(out[2:], plain(ids)[2:])  # rest untouched
+    big = torch.zeros(9, dtype=torch.int64)      # beyond max_rows -> guard
+    assert torch.equal(m.model.embed_tokens(big), plain(big))

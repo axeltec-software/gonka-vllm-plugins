@@ -41,6 +41,14 @@ class MiniMaxM2ForCausalLMPoC(MiniMaxM2ForCausalLM):
             device, dtype = p.device, p.dtype
         except StopIteration:  # pragma: no cover
             device, dtype = torch.device("cuda"), torch.bfloat16
-        attach_native_poc(self, hidden, POC_NATIVE_MAX_ROWS, device, dtype,
+        max_rows = POC_NATIVE_MAX_ROWS
+        if vllm_config is not None:
+            try:
+                max_rows = max(max_rows,
+                               int(vllm_config.scheduler_config
+                                   .max_num_batched_tokens))
+            except Exception:  # pragma: no cover — config shape drift
+                pass
+        attach_native_poc(self, hidden, max_rows, device, dtype,
                           POC_ROUTE_WINDOW_DEFAULT)
         return out

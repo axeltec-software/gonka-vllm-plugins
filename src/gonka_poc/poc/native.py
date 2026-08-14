@@ -75,6 +75,13 @@ class PoCNativeState:
             for _ in range(num_layers)
         ]
         self.mask = torch.zeros(max_rows, 1, device=device, dtype=torch.bool)
+        # Synthetic-embedding buffer: the compiled path is entered with the
+        # ENGINE signature (input_ids tensor, inputs_embeds None) and the
+        # embed_tokens patch swaps in these rows by mask — the 0.20
+        # PoCEmbeddingWrapper role (its DROP verdict in the inventory was
+        # wrong: feeding inputs_embeds from outside forces the eager path).
+        self.embeds = torch.zeros(max_rows, hidden_size, device=device,
+                                  dtype=dtype)
         self.route_step = torch.zeros(max_rows, dtype=torch.int64, device=device)
         self._route_base: List[torch.Tensor] = []
         self.router_meta: List[tuple] = []
@@ -150,6 +157,11 @@ class PoCNativeState:
             self._route_key = base_key
         self.route_step[:n].fill_(int(step))
 
+    def set_embeds(self, x: torch.Tensor) -> None:
+        """Stage synthetic embedding rows for the next PoC forward (in place;
+        address-stable — a captured graph reads live values)."""
+        self.embeds[:x.shape[0]].copy_(x)
+
     def clear(self) -> None:
         """Identity for everything (defensive; engine paths never see us)."""
         self.mask.zero_()
@@ -195,6 +207,15 @@ def attach_native_poc(model: nn.Module, hidden_size: int, max_rows: int,
     layers = list(owner.layers)
     state = PoCNativeState(len(layers), hidden_size, max_rows, device, dtype)
 
+    emb = getattr(owner, "embed_tokens", None)
+    if emb is not None:
+        _patch_embed_forward(emb, state)
+        state.has_embed_patch = True
+    else:
+        state.has_embed_patch = False
+        logger.warning("PoC native: no embed_tokens on decoder owner — "
+                       "compiled entry unavailable, eager fallback only")
+
     for li, layer in enumerate(layers):
         _patch_layer_forward(layer, state, li)
         moe = _find_layer_moe(layer)
@@ -208,10 +229,30 @@ def attach_native_poc(model: nn.Module, hidden_size: int, max_rows: int,
         _patch_gate_forward(moe, state, route_base, n_exp, top_k)
 
     logger.info("PoC native attached: %d layers patched, %d MoE gates seeded, "
-                "route window %d", len(layers), len(state.router_meta),
-                route_window)
+                "embed patch %s, route window %d", len(layers),
+                len(state.router_meta), state.has_embed_patch, route_window)
     model._poc_native_state = state
     return state
+
+
+def _patch_embed_forward(emb: nn.Module, state: "PoCNativeState"):
+    """Swap embedding rows for staged synthetic embeds on PoC rows.
+
+    Lets the PoC loop call the model with the ENGINE signature (input_ids
+    tensor, inputs_embeds None) so the ``@support_torch_compile`` path is
+    taken; with the mask all-zero this is an exact identity for chat.
+    """
+    orig = emb.forward
+
+    def forward(input_ids):
+        out = orig(input_ids)
+        n = out.shape[0]
+        mask = state.mask
+        if n > mask.shape[0]:
+            return out  # chat batch beyond PoC buffers: untouched
+        return torch.where(mask[:n], state.embeds[:n].to(out.dtype), out)
+
+    emb.forward = forward
 
 
 def _find_layer_moe(layer: nn.Module):
@@ -230,6 +271,9 @@ def _patch_layer_forward(layer: nn.Module, state: "PoCNativeState", li: int):
     def forward(*args, **kwargs):
         out = orig(*args, **kwargs)
         vbuf, mask = state.vectors[li], state.mask
+        first = out[0] if isinstance(out, tuple) else out
+        if first.shape[0] > mask.shape[0]:
+            return out  # chat batch beyond PoC buffers: untouched (shape guard)
         if isinstance(out, tuple) and len(out) == 2:
             hidden, residual = out
             n = hidden.shape[0]
@@ -257,6 +301,8 @@ def _patch_gate_forward(moe: nn.Module, state: "PoCNativeState",
         out = orig(*args, **kwargs)
         logits = out[0] if isinstance(out, tuple) else out
         n = logits.shape[0]
+        if n > mask.shape[0]:
+            return out  # chat batch beyond PoC buffers: untouched
         forced = expert_logits_from_base(
             route_base[:n], step_buf[:n], n_experts, top_k,
             logits.device).to(logits.dtype)

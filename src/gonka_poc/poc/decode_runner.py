@@ -199,16 +199,25 @@ def execute_poc_decode(
                                 dim=hidden_size, seq_len=seq_len,
                                 device=device, dtype=dtype)
 
+    if not getattr(state, "has_embed_patch", False):
+        raise RuntimeError(
+            "decode-PoC: embed_tokens patch missing — the compiled engine "
+            "path needs in-model embedding swap (eager is not a mode)")
+
+    # ENGINE signature: input_ids tensor + inputs_embeds None — the exact
+    # shape @support_torch_compile was compiled under. Synthetic embeds are
+    # staged into state and swapped in by the embed patch INSIDE the graph.
+    ids_pf = torch.zeros(batch * seq_len, dtype=torch.int64, device=device)
     state.set_rows(block_hash, batch * seq_len)
     state.set_routing(block_hash, nonces, seq_len, 0)
+    state.set_embeds(embeds_pf.view(-1, hidden_size))
 
     with set_forward_context(attn_pf, vllm_config,
                              num_tokens=batch * seq_len,
                              slot_mapping=slots_pf,
                              skip_compiled=_SKIP_COMPILED):
-        hidden = model(input_ids=None, positions=positions_pf,
-                       intermediate_tensors=None,
-                       inputs_embeds=embeds_pf.view(-1, hidden_size))
+        hidden = model(input_ids=ids_pf, positions=positions_pf,
+                       intermediate_tensors=None, inputs_embeds=None)
     if isinstance(hidden, tuple):
         hidden = hidden[0]
     last_pf = hidden.view(batch, seq_len, -1)[:, -1, :]
@@ -219,6 +228,7 @@ def execute_poc_decode(
     # ------------------------------------------------------------- decode --
     positions_step = torch.empty(batch, dtype=torch.int64, device=device)
     steps_t = torch.empty(batch, dtype=torch.int64, device=device)
+    ids_step = torch.zeros(batch, dtype=torch.int64, device=device)
     for t in range(1, max_tokens + 1):
         steps_t.fill_(t)
         positions_step.fill_(seq_len + t - 1)
@@ -232,11 +242,12 @@ def execute_poc_decode(
             alloc_len=alloc_len, decode_step=seq_len + t - 1)
         state.set_rows(block_hash, batch)
         state.set_routing(block_hash, nonces, 1, t)
+        state.set_embeds(embeds_t)
         with set_forward_context(attn_t, vllm_config, num_tokens=batch,
                                  slot_mapping=slots_t,
                                  skip_compiled=_SKIP_COMPILED):
-            h = model(input_ids=None, positions=positions_step,
-                      intermediate_tensors=None, inputs_embeds=embeds_t)
+            h = model(input_ids=ids_step, positions=positions_step,
+                      intermediate_tensors=None, inputs_embeds=None)
         if isinstance(h, tuple):
             h = h[0]
         sph_t = random_pick_indices_gpu(base_seeds, prev_k, steps_t,
