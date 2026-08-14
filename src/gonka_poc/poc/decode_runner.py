@@ -82,6 +82,78 @@ POC_DECODE_PREFILL_CHUNK = int(os.environ.get("POC_DECODE_PREFILL_CHUNK", "128")
 POC_DECODE_MAX_BATCH = int(os.environ.get("POC_DECODE_MAX_BATCH", "512"))
 
 
+
+def _build_step_meta(worker, sm, batch, kv_len, positions, alloc_len,
+                     borrowed_block_ids, borrowed_stripe, decode_step):
+    """Build decode-step attention metadata from STABLE tensors only.
+
+    Every tensor handed to builder.build() or the forward context lives in
+    ``sm`` (per-(batch,alloc_len) bundle) and is refreshed IN PLACE: with a
+    captured graph, any kernel that ends up reading one of our tensors must
+    find it at the address recorded at capture time. Rebuilding them per
+    step worked for generation only by allocator coincidence (identical
+    allocation sequences -> identical addresses); one extra allocation in
+    the validation path shifted everything and the replays read garbage.
+    """
+    from gonka_poc._compat import current as _compat_current
+    from .poc_model_runner import _borrowed_layout, _inplace_layout
+    compat = _compat_current()
+
+    sm["seq_gpu"].fill_(kv_len)
+    sm["seq_cpu"].fill_(kv_len)
+    sm["ncomp_cpu"].fill_(kv_len - 1)
+
+    def _layout_for_block_size(g_block, m_block):
+        key = (g_block, m_block)
+        st = sm["groups"].get(key)
+        if st is None or sm["lease_dirty"]:
+            if borrowed_block_ids is not None:
+                slot_all, table = _borrowed_layout(
+                    batch, alloc_len, g_block, m_block,
+                    borrowed_block_ids, int(borrowed_stripe or 0),
+                    positions.device)
+            else:
+                slot_all, table = _inplace_layout(
+                    batch, alloc_len, g_block, positions.device)
+            if st is None:
+                st = {"slot_all": slot_all.view(batch, alloc_len).clone(),
+                      "table": table.clone(),
+                      "slot": torch.empty(batch, dtype=slot_all.dtype,
+                                          device=slot_all.device)}
+                sm["groups"][key] = st
+            else:
+                st["slot_all"].copy_(slot_all.view(batch, alloc_len))
+                st["table"].copy_(table)
+        st["slot"].copy_(st["slot_all"][:, decode_step])
+        return st["slot"], st["table"]
+
+    def _common(slot_mapping, block_table):
+        return compat.build_common_attention_metadata(
+            positions=positions,
+            query_start_loc=sm["qsl_gpu"],
+            query_start_loc_cpu=sm["qsl_cpu"],
+            seq_lens=sm["seq_gpu"],
+            num_reqs=batch,
+            num_actual_tokens=batch,
+            max_query_len=1,
+            max_seq_len=kv_len,
+            block_table_tensor=block_table,
+            slot_mapping=slot_mapping,
+            causal=True,
+            _seq_lens_cpu=sm["seq_cpu"],
+            seq_lens_cpu_upper_bound=sm["seq_cpu"],
+            _num_computed_tokens_cpu=sm["ncomp_cpu"],
+        )
+
+    out = compat.build_attn_metadata_per_group(
+        worker.model_runner,
+        layout_for_block_size=_layout_for_block_size,
+        common_metadata_for_layout=_common,
+    )
+    sm["lease_dirty"] = False
+    return out
+
+
 @torch.inference_mode()
 def execute_poc_decode(
     worker,
@@ -281,15 +353,25 @@ def execute_poc_decode(
         positions_step = bundle["positions"]
         steps_t = bundle["steps"]
         ids_step = bundle["ids"]
+        step_meta = bundle["step_meta"]
     else:
         positions_step = torch.empty(batch, dtype=torch.int64, device=device)
         steps_t = torch.empty(batch, dtype=torch.int64, device=device)
         ids_step = torch.zeros(batch, dtype=torch.int64, device=device)
+        step_meta = {
+            "qsl_gpu": torch.arange(batch + 1, dtype=torch.int32,
+                                    device=device),
+            "qsl_cpu": torch.arange(batch + 1, dtype=torch.int32,
+                                    device="cpu"),
+            "seq_gpu": torch.empty(batch, dtype=torch.int32, device=device),
+            "seq_cpu": torch.empty(batch, dtype=torch.int32, device="cpu"),
+            "ncomp_cpu": torch.empty(batch, dtype=torch.int32, device="cpu"),
+            "groups": {},
+            "lease_dirty": True,
+        }
+    step_meta["lease_dirty"] = True   # lease changes between RPCs
     graph = bundle["graph"] if bundle else None
     g_hidden = bundle["hidden"] if bundle else None
-    slot_pairs = bundle["slot_pairs"] if bundle else []
-    stable_slots: Optional[Dict[str, torch.Tensor]] = (
-        bundle["stable_slots"] if bundle else None)
     prof = [0.0, 0.0, 0.0, 0.0] if _PROFILE else None  # meta/embeds/fwd/snap
     # Replay fence: builder.build() copies the step's FlashInfer plan into
     # the SAME persistent device buffers every step. With graph replays the
@@ -313,11 +395,10 @@ def execute_poc_decode(
         if prof is not None:
             torch.cuda.synchronize(); _t1 = time.perf_counter()
             prof[1] += _t1 - _t0; _t0 = _t1
-        attn_t, slots_t = _create_v1_attn_metadata(
-            batch, 1, device, worker, positions_step,
-            borrowed_block_ids=borrowed_block_ids,
-            borrowed_stripe=borrowed_stripe,
-            alloc_len=alloc_len, decode_step=seq_len + t - 1)
+        attn_t, slots_t = _build_step_meta(
+            worker, step_meta, batch, seq_len + t, positions_step,
+            alloc_len, borrowed_block_ids, borrowed_stripe,
+            decode_step=seq_len + t - 1)
         if prof is not None:
             torch.cuda.synchronize(); _t1 = time.perf_counter()
             prof[0] += _t1 - _t0; _t0 = _t1
@@ -325,34 +406,23 @@ def execute_poc_decode(
         state.set_routing(block_hash, nonces, 1, t)
         state.set_embeds(embeds_t)
         if graph is not None:
-            for buf, name in slot_pairs:
-                buf.copy_(slots_t[name])
             graph.replay()
             replay_done.record()
             h = g_hidden
         else:
-            if capture_wanted and t == 1:
-                # Unique per-group slot tensors -> stable clones; every layer
-                # of a group shares one tensor, keep that sharing.
-                uniq: Dict[int, torch.Tensor] = {}
-                stable_slots = {}
-                for name, src in slots_t.items():
-                    key = src.data_ptr()
-                    if key not in uniq:
-                        uniq[key] = src.clone()
-                        slot_pairs.append((uniq[key], name))
-                    stable_slots[name] = uniq[key]
-                slots_for_ctx = stable_slots
-            else:
-                slots_for_ctx = slots_t
             with set_forward_context(attn_t, vllm_config, num_tokens=batch,
-                                     slot_mapping=slots_for_ctx,
+                                     slot_mapping=slots_t,
                                      skip_compiled=_SKIP_COMPILED):
                 h = model(input_ids=ids_step, positions=positions_step,
                           intermediate_tensors=None, inputs_embeds=None)
                 if capture_wanted and t == 1:
-                    # Same inputs, same KV slot: re-running step 1 during
-                    # capture is idempotent (writes the same bytes).
+                    # vLLM-style capture discipline: the capture pass only
+                    # RECORDS the graph — its output is discarded and step 1
+                    # is then executed as a REPLAY, so every step of every
+                    # RPC runs through the identical replay path (the
+                    # capture-pass execution itself proved bit-divergent).
+                    # Same inputs + same KV slot => the warmup, capture and
+                    # replay writes of step 1 all land the same bytes.
                     try:
                         graph = torch.cuda.CUDAGraph()
                         with torch.cuda.graph(graph):
@@ -362,12 +432,13 @@ def execute_poc_decode(
                                              inputs_embeds=None)
                         if isinstance(g_hidden, tuple):
                             g_hidden = g_hidden[0]
+                        graph.replay()
+                        replay_done.record()
                         h = g_hidden
                         _GRAPH_CACHE[cache_key] = {
                             "graph": graph, "hidden": g_hidden,
                             "positions": positions_step, "steps": steps_t,
-                            "ids": ids_step, "slot_pairs": slot_pairs,
-                            "stable_slots": stable_slots,
+                            "ids": ids_step, "step_meta": step_meta,
                         }
                         logger.info("PoC decode: step graph captured "
                                     "(batch %d, alloc %d)", batch, alloc_len)
