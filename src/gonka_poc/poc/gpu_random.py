@@ -14,7 +14,7 @@ validation. Bitwise equality of outputs is neither required nor checked.
 """
 import hashlib
 import math
-from typing import List
+from typing import List, Optional
 
 import logging
 
