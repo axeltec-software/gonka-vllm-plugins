@@ -29,6 +29,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import time
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -55,6 +56,9 @@ _MARGIN_TAU = float(os.environ.get("VLLM_POC_MARGIN_TAU", "0") or "0")
 # Compiled path is the default (0.20 bit reference); eager only as a debug
 # fallback behind the flag (migration rule: eager is not an execution mode).
 _SKIP_COMPILED = os.environ.get("POC_DECODE_SKIP_COMPILED", "0") == "1"
+# Per-step wall-clock breakdown (metadata/embeds/forward/snap) logged once per
+# chunk; costs one cuda sync per step — diagnostics only, keep off in prod.
+_PROFILE = os.environ.get("POC_DECODE_PROFILE", "0") == "1"
 POC_DECODE_PREFILL_CHUNK = int(os.environ.get("POC_DECODE_PREFILL_CHUNK", "128"))
 
 
@@ -235,17 +239,26 @@ def execute_poc_decode(
     positions_step = torch.empty(batch, dtype=torch.int64, device=device)
     steps_t = torch.empty(batch, dtype=torch.int64, device=device)
     ids_step = torch.zeros(batch, dtype=torch.int64, device=device)
+    prof = [0.0, 0.0, 0.0, 0.0] if _PROFILE else None  # meta/embeds/fwd/snap
     for t in range(1, max_tokens + 1):
+        if prof is not None:
+            torch.cuda.synchronize(); _t0 = time.perf_counter()
         steps_t.fill_(t)
         positions_step.fill_(seq_len + t - 1)
         embeds_t = generate_decode_inputs_gpu(base_seeds, prev_k, steps_t,
                                               hidden_size, device).view(
                                                   batch, hidden_size).to(dtype)
+        if prof is not None:
+            torch.cuda.synchronize(); _t1 = time.perf_counter()
+            prof[1] += _t1 - _t0; _t0 = _t1
         attn_t, slots_t = _create_v1_attn_metadata(
             batch, 1, device, worker, positions_step,
             borrowed_block_ids=borrowed_block_ids,
             borrowed_stripe=borrowed_stripe,
             alloc_len=alloc_len, decode_step=seq_len + t - 1)
+        if prof is not None:
+            torch.cuda.synchronize(); _t1 = time.perf_counter()
+            prof[0] += _t1 - _t0; _t0 = _t1
         state.set_rows(block_hash, batch)
         state.set_routing(block_hash, nonces, 1, t)
         state.set_embeds(embeds_t)
@@ -256,9 +269,25 @@ def execute_poc_decode(
                       intermediate_tensors=None, inputs_embeds=None)
         if isinstance(h, tuple):
             h = h[0]
+        if prof is not None:
+            torch.cuda.synchronize(); _t1 = time.perf_counter()
+            prof[2] += _t1 - _t0; _t0 = _t1
         sph_t = random_pick_indices_gpu(base_seeds, prev_k, steps_t,
                                         hidden_size, SPHERE_DIM, device)
         snap_rows(h.view(batch, -1), sph_t, t)
+        if prof is not None:
+            torch.cuda.synchronize()
+            prof[3] += time.perf_counter() - _t0
+    if prof is not None:
+        tot = sum(prof) or 1.0
+        logger.info(
+            "PoC decode profile (%d steps, batch %d): metadata %.1fms/step "
+            "(%.0f%%), embeds %.1fms (%.0f%%), forward %.1fms (%.0f%%), "
+            "snap %.1fms (%.0f%%)", max_tokens, batch,
+            1e3*prof[0]/max_tokens, 100*prof[0]/tot,
+            1e3*prof[1]/max_tokens, 100*prof[1]/tot,
+            1e3*prof[2]/max_tokens, 100*prof[2]/tot,
+            1e3*prof[3]/max_tokens, 100*prof[3]/tot)
 
     state.clear()
 
