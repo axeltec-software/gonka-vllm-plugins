@@ -416,6 +416,13 @@ def execute_poc_decode(
                 h = model(input_ids=ids_step, positions=positions_step,
                           intermediate_tensors=None, inputs_embeds=None)
                 if capture_wanted and t == 1:
+                    # Second warmup: DeepGEMM JIT finishes lazy module loads
+                    # on the first call of a shape; capturing over a
+                    # cold-JIT call died with CUDA_ERROR_ILLEGAL_INSTRUCTION
+                    # on fresh boots. Same inputs + same KV slot = same
+                    # bytes, so the extra call is idempotent.
+                    h = model(input_ids=ids_step, positions=positions_step,
+                              intermediate_tensors=None, inputs_embeds=None)
                     # vLLM-style capture discipline: the capture pass only
                     # RECORDS the graph — its output is discarded and step 1
                     # is then executed as a REPLAY, so every step of every
