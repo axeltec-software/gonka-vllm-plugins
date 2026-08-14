@@ -165,7 +165,8 @@ def _inplace_layout(batch_size, seq_len, g_block, device):
 
 
 def _create_v1_attn_metadata(batch_size, seq_len, device, worker, positions,
-                             borrowed_block_ids=None, borrowed_stripe=None):
+                             borrowed_block_ids=None, borrowed_stripe=None,
+                             alloc_len=None, decode_step=None):
     """Create attention metadata, built independently for every attention group.
 
     Models may register KV cache groups with DIFFERENT block sizes (e.g.
@@ -191,24 +192,52 @@ def _create_v1_attn_metadata(batch_size, seq_len, device, worker, positions,
     ``positions`` is the shared per-token position tensor (also passed to the
     model forward); DeepSeek-V4's C128A metadata builder requires it, every
     other v0.23 backend ignores ``cm.positions``.
+
+    Decode-PoC extensions (both None => the prefill behaviour above is
+    BIT-PATH UNCHANGED):
+      * ``alloc_len``   — reserve the layout for this many slots per sequence
+        (``seq_len + max_tokens``; the lease is taken up-front, no growth);
+      * ``decode_step`` — build metadata for ONE decode token per sequence at
+        absolute position ``decode_step`` (query_len 1, seq_len
+        ``decode_step+1``, slot ``decode_step`` of each row).
     """
     compat = _compat_current()
-    total_tokens = batch_size * seq_len
+    layout_len = int(alloc_len) if alloc_len is not None else seq_len
+
+    if decode_step is None:
+        q_len, kv_len = seq_len, seq_len
+        n_computed = 0
+    else:
+        q_len, kv_len = 1, int(decode_step) + 1
+        n_computed = int(decode_step)
+    total_tokens = batch_size * q_len
 
     query_start_loc_gpu = (
-        torch.arange(batch_size + 1, dtype=torch.int32, device=device) * seq_len)
+        torch.arange(batch_size + 1, dtype=torch.int32, device=device) * q_len)
     query_start_loc_cpu = (
-        torch.arange(batch_size + 1, dtype=torch.int32, device="cpu") * seq_len)
-    seq_lens_gpu = torch.full((batch_size,), seq_len, dtype=torch.int32, device=device)
-    seq_lens_cpu = torch.full((batch_size,), seq_len, dtype=torch.int32, device="cpu")
-    num_computed_cpu = torch.zeros(batch_size, dtype=torch.int32, device="cpu")
+        torch.arange(batch_size + 1, dtype=torch.int32, device="cpu") * q_len)
+    seq_lens_gpu = torch.full((batch_size,), kv_len, dtype=torch.int32, device=device)
+    seq_lens_cpu = torch.full((batch_size,), kv_len, dtype=torch.int32, device="cpu")
+    num_computed_cpu = torch.full((batch_size,), n_computed, dtype=torch.int32,
+                                  device="cpu")
 
     def _layout(g_block, m_block):
         if borrowed_block_ids is not None:
-            return _borrowed_layout(
-                batch_size, seq_len, g_block, m_block,
+            slot_all, table = _borrowed_layout(
+                batch_size, layout_len, g_block, m_block,
                 borrowed_block_ids, int(borrowed_stripe or 0), device)
-        return _inplace_layout(batch_size, seq_len, g_block, device)
+        else:
+            slot_all, table = _inplace_layout(batch_size, layout_len, g_block,
+                                              device)
+        if alloc_len is None:
+            return slot_all, table
+        # slot_all covers layout_len slots per row; cut the piece this forward
+        # actually writes: prefill -> first seq_len slots, decode -> slot
+        # ``decode_step`` of each row.
+        per_row = slot_all.view(batch_size, layout_len)
+        if decode_step is None:
+            return per_row[:, :seq_len].reshape(-1), table
+        return per_row[:, int(decode_step)].reshape(-1), table
 
     layouts = {}
 
@@ -226,8 +255,8 @@ def _create_v1_attn_metadata(batch_size, seq_len, device, worker, positions,
             seq_lens=seq_lens_gpu,
             num_reqs=batch_size,
             num_actual_tokens=total_tokens,
-            max_query_len=seq_len,
-            max_seq_len=seq_len,
+            max_query_len=q_len,
+            max_seq_len=kv_len,
             block_table_tensor=block_table,
             slot_mapping=slot_mapping,
             causal=True,

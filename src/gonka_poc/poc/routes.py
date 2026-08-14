@@ -133,6 +133,14 @@ class PoCParamsModel(BaseModel):
     model: str
     seq_len: int
     k_dim: int = 12
+    # Decode-PoC (the canonical scheme of this release). max_tokens == 0 keeps
+    # the prefill-only artifact of the DECODE seed scheme (decision #1);
+    # poc_decode := max_tokens > 0 (decision #7 — no server flag).
+    max_tokens: int = 0
+    # Routing window: consensus value ships in the request from the Go node
+    # reading the on-chain config; recorded in the artifact encoding
+    # (decisions #6/#11, release value 256).
+    route_window: int = 256
 
 
 class PoCInitGenerateRequest(BaseModel):
@@ -181,7 +189,9 @@ class NonceIterator:
 
 class ArtifactModel(BaseModel):
     nonce: int
-    vector_b64: str
+    vector_b64: str = ""
+    # Decode-PoC trajectory (reference for teacher-forced validation).
+    k_points_steps: Optional[List[int]] = None
 
 
 class ValidationModel(BaseModel):
@@ -208,6 +218,14 @@ class PoCGenerateRequest(BaseModel):
     validation: Optional[ValidationModel] = None
     stat_test: Optional[StatTestModel] = None
     poc_stronger_rng: bool = False
+    # Decode-PoC: reference trajectories for teacher forcing (0.20 wire shape:
+    # {nonce: [k0..kN]}); alternatively taken from validation.artifacts'
+    # k_points_steps. Emission of pre-snap slices: debug (all steps) or the
+    # leading va_steps window (decision #8 — request parameter).
+    enforced_k_steps: Optional[Dict[int, List[int]]] = None
+    debug: bool = False
+    poc_vector_artifact_steps: int = 0
+    per_nonce_reflection: bool = False
 
 
 # =============================================================================
@@ -668,6 +686,11 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
         
         return {"status": "queued", "request_id": request_id, "queued_count": len(body.nonces)}
     
+    # ---------------------------------------------------------------- decode --
+    # Decode-PoC (canonical scheme): poc_decode := max_tokens > 0 (decision #7).
+    if body.params.max_tokens > 0:
+        return await _generate_decode(request, body, engine_client, app_id)
+
     while _is_generation_active(app_id):
         await asyncio.sleep(GENERATION_ACTIVE_POLL_SEC)
 
@@ -728,6 +751,107 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
         "status": "completed",
         "request_id": str(uuid.uuid4()),
         **validation_result,
+    }
+
+
+async def _generate_decode(request: Request, body: PoCGenerateRequest,
+                           engine_client, app_id: int) -> dict:
+    """Decode-PoC wait-path: chunked prefill+steps loop on the workers.
+
+    Chunk size: min(batch_size or AUTO, POC_DECODE_PREFILL_CHUNK) — the
+    prefill of a chunk must fit the pre-sized MoE workspace (v0.1.3 lesson);
+    batch_size == 0 means AUTO (decision #5).
+    """
+    from gonka_poc.poc.decode_runner import POC_DECODE_PREFILL_CHUNK
+    from .data import fraud_test
+
+    seq_len = body.params.seq_len
+    max_tokens = body.params.max_tokens
+    alloc_len = seq_len + max_tokens
+
+    # teacher forcing reference: explicit field wins, else validation.artifacts
+    enforced = body.enforced_k_steps
+    if enforced is None and body.validation:
+        traj = {a.nonce: a.k_points_steps for a in body.validation.artifacts
+                if a.k_points_steps}
+        enforced = traj or None
+    validating = enforced is not None
+    if validating:
+        missing = [n for n in body.nonces if n not in enforced]
+        if missing:
+            raise HTTPException(
+                status_code=400,
+                detail=f"enforced_k_steps missing for nonces {missing[:5]}...")
+
+    chunk_size = body.batch_size if body.batch_size > 0 else POC_DECODE_PREFILL_CHUNK
+    chunk_size = min(chunk_size, POC_DECODE_PREFILL_CHUNK)
+
+    total = len(body.nonces)
+    start_time = time.time()
+    artifacts: List[dict] = []
+    mismatch_total = 0
+    steps_total = 0
+
+    async with poc_reservation(engine_client, chunk_size, alloc_len) as lease:
+        for i in range(0, total, chunk_size):
+            chunk = body.nonces[i:i + chunk_size]
+            while _is_generation_active(app_id):
+                await asyncio.sleep(GENERATION_ACTIVE_POLL_SEC)
+            kwargs = dict(
+                block_hash=body.block_hash,
+                public_key=body.public_key,
+                nonces=chunk,
+                seq_len=seq_len,
+                max_tokens=max_tokens,
+                route_window=body.params.route_window,
+                enforced_k_steps=(
+                    {n: enforced[n] for n in chunk} if validating else None),
+                debug=body.debug,
+                va_steps=body.poc_vector_artifact_steps,
+                per_nonce_reflection=body.per_nonce_reflection,
+            )
+            if lease is not None:
+                kwargs["borrowed_block_ids"] = lease["block_ids"]
+                kwargs["borrowed_stripe"] = lease["blocks_per_seq"]
+            results = await asyncio.wait_for(
+                engine_client.collective_rpc("execute_poc_decode",
+                                             kwargs=kwargs),
+                timeout=POC_RPC_TIMEOUT_MS / 1000.0 * max(1, max_tokens // 32),
+            )
+            result = next((r for r in results if r), None)
+            if result is None:
+                raise HTTPException(status_code=500,
+                                    detail="decode chunk returned no result")
+            artifacts.extend(result["artifacts"])
+            steps_total += int(result.get("steps_total") or 0)
+            if validating:
+                mismatch_total += int(result.get("mismatch_total") or 0)
+
+    elapsed = time.time() - start_time
+    rate = total / elapsed if elapsed > 0 else 0
+    logger.info("PoC /generate decode: %d nonces x %d steps in %.2fs (%.2f/s)",
+                total, max_tokens + 1, elapsed, rate)
+
+    encoding = wire_encoding(body.params.k_dim)
+    encoding["route_window"] = body.params.route_window   # decision #6
+    encoding["seq_len"] = seq_len
+    encoding["max_tokens"] = max_tokens
+
+    if not validating:
+        return {"status": "completed", "request_id": str(uuid.uuid4()),
+                "artifacts": artifacts, "encoding": encoding}
+
+    st = body.stat_test or StatTestModel()
+    p_value, fraud = fraud_test(
+        n_mismatch=mismatch_total, n_total=steps_total,
+        p_mismatch=st.p_mismatch, fraud_threshold=st.fraud_threshold)
+    rate_mism = mismatch_total / steps_total if steps_total else 0.0
+    return {
+        "status": "completed", "request_id": str(uuid.uuid4()),
+        "artifacts": artifacts, "encoding": encoding,
+        "n_mismatch": mismatch_total, "n_total": steps_total,
+        "mismatch_rate": rate_mism, "p_value": p_value,
+        "fraud_detected": fraud,
     }
 
 

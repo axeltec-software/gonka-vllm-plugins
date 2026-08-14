@@ -155,6 +155,55 @@ class PoCWorkerExtension:
 
         return {"artifacts": artifacts, "rank": rank}
 
+    def execute_poc_decode(
+        self,
+        block_hash: str,
+        public_key: str,
+        nonces,
+        seq_len: int,
+        max_tokens: int,
+        route_window: int = 256,
+        enforced_k_steps=None,
+        debug: bool = False,
+        va_steps: int = 0,
+        per_nonce_reflection: bool = False,
+        borrowed_block_ids=None,
+        borrowed_stripe=None,
+    ):
+        """Decode-PoC chunk (prefill + max_tokens chained steps) — the new
+        scheme\'s worker entry. Mirrors ``execute_poc_forward``\'s RPC shape:
+        every rank runs it, the TP driver returns artifacts, other ranks
+        return None and the API server aggregates.
+        """
+        from gonka_poc.poc.decode_runner import execute_poc_decode as _run
+        hidden_size = int(self.vllm_config.model_config.get_hidden_size())
+        try:
+            return _run(
+                self,
+                block_hash=block_hash,
+                public_key=public_key,
+                nonces=list(nonces),
+                seq_len=int(seq_len),
+                max_tokens=int(max_tokens),
+                hidden_size=int(hidden_size),
+                route_window=int(route_window),
+                enforced_k_steps=(
+                    {int(k): list(v) for k, v in enforced_k_steps.items()}
+                    if enforced_k_steps else None),
+                debug=bool(debug),
+                va_steps=int(va_steps),
+                per_nonce_reflection=bool(per_nonce_reflection),
+                borrowed_block_ids=(
+                    list(borrowed_block_ids)
+                    if borrowed_block_ids is not None else None),
+                borrowed_stripe=(
+                    int(borrowed_stripe)
+                    if borrowed_stripe is not None else None),
+            )
+        except Exception:  # noqa: BLE001 — surface via RPC, never hang the rank
+            logger.exception("execute_poc_decode failed")
+            raise
+
     def execute_poc_borrow_compat(self) -> Dict[str, Any]:
         """Report whether borrowed-lease validation is bit-safe on this rank.
 

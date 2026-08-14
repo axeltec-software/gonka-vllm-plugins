@@ -1,0 +1,120 @@
+# SPDX-License-Identifier: Apache-2.0
+"""CPU checks for the ported native wrappers (layer B plumbing).
+
+A tiny fake model (decoder .layers with a .gate/.experts MoE inside) exercises
+attach discovery, mask identity, the Householder reflection and the seeded
+router override — no vLLM, no GPU.
+"""
+import torch
+from torch import nn
+
+from gonka_poc.poc import gpu_random
+from gonka_poc.poc.native import (
+    PoCLayerWrapper,
+    PoCRouterWrapper,
+    attach_native_poc,
+)
+
+H = 32
+
+
+class FakeExperts(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.global_num_experts = 16
+        self.top_k = 2
+
+
+class FakeMoE(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.gate = nn.Linear(H, 16, bias=False)
+        self.experts = FakeExperts()
+
+    def forward(self, x):
+        return self.gate(x)
+
+
+class FakeLayer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.moe = FakeMoE()
+
+    def forward(self, hidden, residual=None):
+        return hidden + 1.0, residual
+
+
+class FakeCore(nn.Module):
+    def __init__(self, n_layers=2):
+        super().__init__()
+        self.layers = nn.ModuleList(FakeLayer() for _ in range(n_layers))
+
+
+class FakeModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.model = FakeCore()
+
+
+def test_attach_discovery_and_idempotence():
+    m = FakeModel()
+    st = attach_native_poc(m, H, max_rows=8, device=torch.device("cpu"),
+                           dtype=torch.float32, route_window=256)
+    assert all(isinstance(l, PoCLayerWrapper) for l in m.model.layers)
+    assert len(st.router_meta) == 2 and st.router_meta[0] == (16, 2)
+    assert all(isinstance(l.inner.moe.gate, PoCRouterWrapper)
+               for l in m.model.layers)
+    again = attach_native_poc(m, H, 8, torch.device("cpu"),
+                              torch.float32, 256)
+    assert again is st  # idempotent
+
+
+def test_layer_wrapper_identity_when_masked_off():
+    m = FakeModel()
+    st = attach_native_poc(m, H, 4, torch.device("cpu"), torch.float32, 256)
+    st.clear()
+    x = torch.randn(4, H)
+    out, _ = m.model.layers[0](x, None)
+    assert torch.equal(out, x + 1.0)  # exact identity path
+
+
+def test_layer_wrapper_reflects_poc_rows():
+    m = FakeModel()
+    st = attach_native_poc(m, H, 4, torch.device("cpu"), torch.float32, 256)
+    bh = "deadbeef" * 8
+    st.set_rows([bh, None, bh, None], [None] * 4)
+    x = torch.randn(4, H)
+    out, _ = m.model.layers[0](x, None)
+    base = x + 1.0
+    v = gpu_random.generate_householder_vector(
+        f"{bh}_layer_0_householder", H, torch.device("cpu"))
+    expect0 = base[0] - 2.0 * (base[0] @ v) * v
+    assert torch.allclose(out[0], expect0, atol=1e-6)
+    assert torch.equal(out[1], base[1])          # non-PoC row untouched
+
+
+def test_router_wrapper_forces_seeded_logits():
+    m = FakeModel()
+    st = attach_native_poc(m, H, 4, torch.device("cpu"), torch.float32, 256)
+    bh = "deadbeef" * 8
+    st.set_rows([bh] * 4, [None] * 4)
+    st.set_routing([bh] * 4, [0, 1, 2, 3], [5] * 4)
+    x = torch.randn(4, H)
+    logits = m.model.layers[0].inner.moe(x)
+    # expected: seeded logits for (bh, nonce, step=5, layer=0)
+    for row, nonce in enumerate([0, 1, 2, 3]):
+        exp = gpu_random.seeded_experts(bh, nonce, 5, 0, 16, 2,
+                                        torch.device("cpu"))
+        got = torch.topk(logits[row], 2).indices
+        assert torch.equal(torch.sort(got).values,
+                           torch.sort(exp).values), f"row {row}"
+
+
+def test_per_nonce_reflection_changes_vectors():
+    m = FakeModel()
+    st = attach_native_poc(m, H, 2, torch.device("cpu"), torch.float32, 256)
+    bh = "deadbeef" * 8
+    st.set_rows([bh, bh], [7, None])
+    x = torch.randn(2, H)
+    out, _ = m.model.layers[0](x, None)
+    assert not torch.allclose(out[0], out[1] - (x[1] - x[0]) - 1.0 + 1.0)
