@@ -140,7 +140,7 @@ class PoCParamsModel(BaseModel):
     # Routing window: consensus value ships in the request from the Go node
     # reading the on-chain config; recorded in the artifact encoding
     # (decisions #6/#11, release value 256).
-    route_window: int = 16    # 0.20 engine default (poc_route_window=16) — the consensus value golden was collected under
+    route_window: int = 256   # shipped profile value (golden collected under it); 256 on 256 experts = legacy full scatter
 
 
 class PoCInitGenerateRequest(BaseModel):

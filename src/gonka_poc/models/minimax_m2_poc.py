@@ -20,11 +20,14 @@ from gonka_poc.poc.native import attach_native_poc
 
 # Buffer cap: prefill rows of the largest decode chunk (nonces * seq_len).
 POC_NATIVE_MAX_ROWS = int(os.environ.get("POC_NATIVE_MAX_ROWS", str(128 * 256)))
-# 0.20 engine default (poc_route_window=16). PROCESS constant: the window is
-# baked into the compiled graph at first compilation (dynamo freezes the
-# global) — request-time switching is impossible by construction, exactly
-# like the 0.20 engine arg. Change via env before start, never per request.
-POC_ROUTE_WINDOW_DEFAULT = int(os.environ.get("POC_ROUTE_WINDOW", "16"))
+# 256 — the SHIPPED value golden was collected under (README: --poc-route-window
+# 256; on MiniMax's 256 experts this selects legacy FULL scatter, window<n_exp
+# is False — docs/04). The 0.20 CODE default is 16, but consensus follows the
+# shipped profile, not the code default. PROCESS constant: the window is baked
+# into the compiled graph at first compilation (dynamo freezes the global) —
+# request-time switching is impossible by construction, exactly like the 0.20
+# engine arg. Change via env before start, never per request.
+POC_ROUTE_WINDOW_DEFAULT = int(os.environ.get("POC_ROUTE_WINDOW", "256"))
 
 
 class MiniMaxM2ForCausalLMPoC(MiniMaxM2ForCausalLM):
