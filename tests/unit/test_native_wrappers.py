@@ -9,11 +9,7 @@ import torch
 from torch import nn
 
 from gonka_poc.poc import gpu_random
-from gonka_poc.poc.native import (
-    PoCLayerWrapper,
-    PoCRouterWrapper,
-    attach_native_poc,
-)
+from gonka_poc.poc.native import attach_native_poc
 
 H = 32
 
@@ -25,14 +21,24 @@ class FakeExperts(nn.Module):
         self.top_k = 2
 
 
+class FakeGate(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.lin = nn.Linear(H, 16, bias=False)
+
+    def forward(self, x):
+        return self.lin(x), None      # GateLinear returns (logits, bias)
+
+
 class FakeMoE(nn.Module):
     def __init__(self):
         super().__init__()
-        self.gate = nn.Linear(H, 16, bias=False)
+        self.gate = FakeGate()
         self.experts = FakeExperts()
 
     def forward(self, x):
-        return self.gate(x)
+        logits, _ = self.gate(x)
+        return logits
 
 
 class FakeLayer(nn.Module):
@@ -60,9 +66,8 @@ def test_attach_discovery_and_idempotence():
     m = FakeModel()
     st = attach_native_poc(m, H, max_rows=8, device=torch.device("cpu"),
                            dtype=torch.float32, route_window=256)
-    assert all(isinstance(l, PoCLayerWrapper) for l in m.model.layers)
     assert len(st.router_meta) == 2 and st.router_meta[0] == (16, 2)
-    assert all(isinstance(l.inner.moe.gate, PoCRouterWrapper)
+    assert all(getattr(l.moe, "_poc_gate_patched", False)
                for l in m.model.layers)
     again = attach_native_poc(m, H, 8, torch.device("cpu"),
                               torch.float32, 256)
@@ -100,7 +105,7 @@ def test_router_wrapper_forces_seeded_logits():
     st.set_rows(bh, 4)
     st.set_routing(bh, [0, 1, 2, 3], 1, 5)
     x = torch.randn(4, H)
-    logits = m.model.layers[0].inner.moe(x)
+    logits = m.model.layers[0].moe(x)
     # expected: seeded logits for (bh, nonce, step=5, layer=0)
     for row, nonce in enumerate([0, 1, 2, 3]):
         exp = gpu_random.seeded_experts(bh, nonce, 5, 0, 16, 2,

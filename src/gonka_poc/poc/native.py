@@ -3,11 +3,11 @@
 Ported from the 0.20 in-tree branch (``vllm/poc/native.py`` @ 5c1d09f55e92)
 into the plugin, trimmed to what the plugin-side decode loop actually needs:
 
-  * ``PoCLayerWrapper``  — per-layer Householder reflection of hidden+residual
-    on PoC rows (identity for non-PoC rows via the shared mask);
-  * ``PoCRouterWrapper`` — REPLACES MoE router logits with deterministic seeded
-    logits on PoC rows (consensus: routing must not read the noise-prone
-    hidden state);
+  * decoder-layer forward MONKEYPATCH — per-layer Householder reflection of
+    hidden+residual on PoC rows (identity for non-PoC rows via the mask);
+  * MoE gate forward MONKEYPATCH — REPLACES router logits with deterministic
+    seeded logits on PoC rows (consensus: routing must not read the
+    noise-prone hidden state);
   * ``PoCNativeState``   — address-stable buffers (reflection vectors, row
     mask, per-layer route bases, shared step buffer) updated IN PLACE, so a
     captured CUDA graph reads live values (migration rule: eager is not an
@@ -49,80 +49,6 @@ def _reflect(x: torch.Tensor, v: torch.Tensor, mask: torch.Tensor) -> torch.Tens
     dot = (x * v).sum(-1, keepdim=True)
     transformed = x - 2.0 * dot * v
     return torch.where(mask, transformed, x)
-
-
-class PoCLayerWrapper(nn.Module):
-    """Wraps one decoder layer; reflects its output hidden + residual on PoC rows.
-
-    0.20: native.py:69-…  ``v`` is this layer's per-row reflection vector
-    ([max_rows, hidden]); ``mask`` the shared per-row PoC mask ([max_rows, 1]).
-    Both are stable buffers updated in place.
-    """
-
-    def __init__(self, inner: nn.Module, v: torch.Tensor, mask: torch.Tensor):
-        super().__init__()
-        self.inner = inner
-        self.register_buffer("poc_v", v, persistent=False)
-        self.register_buffer("poc_mask", mask, persistent=False)
-
-    def __getattr__(self, name: str):
-        try:
-            return super().__getattr__(name)
-        except AttributeError:
-            return getattr(super().__getattr__("inner"), name)
-
-    def forward(self, *args, **kwargs):
-        out = self.inner(*args, **kwargs)
-        if isinstance(out, tuple) and len(out) == 2:
-            hidden, residual = out
-            n = hidden.shape[0]
-            v = self.poc_v[:n]
-            m = self.poc_mask[:n]
-            hidden = _reflect(hidden, v, m)
-            if residual is not None:
-                residual = _reflect(residual, v, m)
-            return hidden, residual
-        hidden = out[0] if isinstance(out, tuple) else out
-        n = hidden.shape[0]
-        hidden = _reflect(hidden, self.poc_v[:n], self.poc_mask[:n])
-        return (hidden, *out[1:]) if isinstance(out, tuple) else hidden
-
-
-class PoCRouterWrapper(nn.Module):
-    """Wraps an MoE gate. PoC rows get deterministic seeded router logits
-    computed INSIDE the forward (capture-safe, pure integer Fisher-Yates via
-    ``expert_logits_from_base``); chat rows keep natural logits.
-
-    0.20: native.py:180-226, ported verbatim in behaviour.
-    """
-
-    def __init__(self, inner: nn.Module, route_base: torch.Tensor,
-                 route_step: torch.Tensor, n_experts: int, top_k: int,
-                 mask: torch.Tensor):
-        super().__init__()
-        self.inner = inner
-        self.n_experts = n_experts
-        self.top_k = top_k
-        self.register_buffer("poc_route_base", route_base, persistent=False)
-        self.register_buffer("poc_route_step", route_step, persistent=False)
-        self.register_buffer("poc_mask", mask, persistent=False)
-
-    def __getattr__(self, name: str):
-        try:
-            return super().__getattr__(name)
-        except AttributeError:
-            return getattr(super().__getattr__("inner"), name)
-
-    def forward(self, *args, **kwargs):
-        out = self.inner(*args, **kwargs)
-        logits = out[0] if isinstance(out, tuple) else out
-        n = logits.shape[0]
-        m = self.poc_mask[:n]
-        forced = expert_logits_from_base(
-            self.poc_route_base[:n], self.poc_route_step[:n],
-            self.n_experts, self.top_k, logits.device).to(logits.dtype)
-        logits = torch.where(m, forced, logits)
-        return (logits, *out[1:]) if isinstance(out, tuple) else logits
 
 
 class PoCNativeState:
@@ -250,33 +176,28 @@ def _find_decoder_layers(model: nn.Module) -> nn.Module:
 
 
 def attach_native_poc(model: nn.Module, hidden_size: int, max_rows: int,
-                      device, dtype, route_window: int) -> PoCNativeState:
-    """Wrap decoder layers (Householder) and every MoE gate (seeded routing).
-
-    0.20: attach_native_poc, minus the embedding/norm wrappers (see module
-    docstring). Idempotent. MUST run before any capture of a PoC step.
-    ``route_window`` is pushed into gpu_random (consensus-affecting).
+                      device, dtype, route_window: int) -> "PoCNativeState":
+    """Bake PoC transforms by MONKEYPATCHING the bound ``forward`` of each
+    decoder layer and each MoE gate — the modules, parameter names and the
+    ``@support_torch_compile`` signature inspection stay intact (wrapping in a
+    new nn.Module renamed params to ``.inner.*`` and broke both weight loading
+    and compile). The patched forward reads live state buffers, so it captures
+    into the compiled graph exactly like the 0.20 attach-before-compile path.
+    Idempotent; chat rows (mask False) are exact identity.
     """
     from .gpu_random import set_route_window
     set_route_window(route_window)
 
-    owner = _find_decoder_layers(model)
-    layers = owner.layers
-    if any(isinstance(l, PoCLayerWrapper) for l in layers):
+    if getattr(model, "_poc_native_state", None) is not None:
         return model._poc_native_state
 
+    owner = _find_decoder_layers(model)
+    layers = list(owner.layers)
     state = PoCNativeState(len(layers), hidden_size, max_rows, device, dtype)
-    for i in range(len(layers)):
-        layers[i] = PoCLayerWrapper(layers[i], state.vectors[i], state.mask)
 
-    for wrapper in layers:
-        inner_layer = getattr(wrapper, "inner", wrapper)
-        moe = next(
-            (m for m in inner_layer.modules()
-             if hasattr(m, "gate") and hasattr(m, "experts")
-             and hasattr(getattr(m, "experts"), "top_k")
-             and not isinstance(m.gate, PoCRouterWrapper)),
-            None)
+    for li, layer in enumerate(layers):
+        _patch_layer_forward(layer, state, li)
+        moe = _find_layer_moe(layer)
         if moe is None:
             continue
         n_exp = int(moe.experts.global_num_experts)
@@ -284,11 +205,63 @@ def attach_native_poc(model: nn.Module, hidden_size: int, max_rows: int,
         route_base = torch.zeros(max_rows, dtype=torch.int64, device=device)
         state._route_base.append(route_base)
         state.router_meta.append((n_exp, top_k))
-        moe.gate = PoCRouterWrapper(moe.gate, route_base, state.route_step,
-                                    n_exp, top_k, state.mask)
+        _patch_gate_forward(moe, state, route_base, n_exp, top_k)
 
-    logger.info(
-        "PoC native attached: %d layers wrapped, %d MoE gates seeded, "
-        "route window pushed", len(layers), len(state.router_meta))
+    logger.info("PoC native attached: %d layers patched, %d MoE gates seeded, "
+                "route window %d", len(layers), len(state.router_meta),
+                route_window)
     model._poc_native_state = state
     return state
+
+
+def _find_layer_moe(layer: nn.Module):
+    return next(
+        (m for m in layer.modules()
+         if hasattr(m, "gate") and hasattr(m, "experts")
+         and hasattr(getattr(m, "experts"), "top_k")
+         and not getattr(m, "_poc_gate_patched", False)),
+        None)
+
+
+def _patch_layer_forward(layer: nn.Module, state: "PoCNativeState", li: int):
+    """Reflect the layer's (hidden, residual) output on PoC rows, in place."""
+    orig = layer.forward
+
+    def forward(*args, **kwargs):
+        out = orig(*args, **kwargs)
+        vbuf, mask = state.vectors[li], state.mask
+        if isinstance(out, tuple) and len(out) == 2:
+            hidden, residual = out
+            n = hidden.shape[0]
+            hidden = _reflect(hidden, vbuf, mask[:n])
+            if residual is not None:
+                residual = _reflect(residual, vbuf, mask[:n])
+            return hidden, residual
+        hidden = out[0] if isinstance(out, tuple) else out
+        n = hidden.shape[0]
+        hidden = _reflect(hidden, vbuf, mask[:n])
+        return (hidden, *out[1:]) if isinstance(out, tuple) else hidden
+
+    layer.forward = forward
+
+
+def _patch_gate_forward(moe: nn.Module, state: "PoCNativeState",
+                        route_base: torch.Tensor, n_experts: int, top_k: int):
+    """Override the MoE gate's logits with seeded logits on PoC rows."""
+    gate = moe.gate
+    orig = gate.forward
+    step_buf = state.route_step
+    mask = state.mask
+
+    def forward(*args, **kwargs):
+        out = orig(*args, **kwargs)
+        logits = out[0] if isinstance(out, tuple) else out
+        n = logits.shape[0]
+        forced = expert_logits_from_base(
+            route_base[:n], step_buf[:n], n_experts, top_k,
+            logits.device).to(logits.dtype)
+        logits = torch.where(mask[:n], forced, logits)
+        return (logits, *out[1:]) if isinstance(out, tuple) else logits
+
+    gate.forward = forward
+    moe._poc_gate_patched = True
