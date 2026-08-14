@@ -44,8 +44,6 @@ CONTRACT WARNINGS:
 """
 from __future__ import annotations
 
-logger = logging.getLogger(__name__)
-
 import logging
 
 from typing import Any, Dict, List, Optional
@@ -58,6 +56,9 @@ from typing import Any, Dict, List, Optional
 # it's safe to import at module scope; routing kv_caches access through the
 # shim keeps the documented private-API touchpoint policy honest.
 from gonka_poc._compat import current as _compat_current
+import logging
+
+logger = logging.getLogger(__name__)
 
 class PoCWorkerExtension:
     """Add-only methods reachable from ``collective_rpc``.
