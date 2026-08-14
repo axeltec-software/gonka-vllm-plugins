@@ -221,8 +221,10 @@ def attach_native_poc(model: nn.Module, hidden_size: int, max_rows: int,
         moe = _find_layer_moe(layer)
         if moe is None:
             continue
-        n_exp = int(moe.experts.global_num_experts)
-        top_k = int(moe.experts.top_k)
+        dims = _moe_dims(moe, getattr(model, "config", None))
+        if dims is None:
+            continue
+        n_exp, top_k = dims
         route_base = torch.zeros(max_rows, dtype=torch.int64, device=device)
         state._route_base.append(route_base)
         state.router_meta.append((n_exp, top_k))
@@ -259,9 +261,37 @@ def _find_layer_moe(layer: nn.Module):
     return next(
         (m for m in layer.modules()
          if hasattr(m, "gate") and hasattr(m, "experts")
-         and hasattr(getattr(m, "experts"), "top_k")
          and not getattr(m, "_poc_gate_patched", False)),
         None)
+
+
+def _moe_dims(moe: nn.Module, hf_config) -> Optional[tuple]:
+    """(n_experts, top_k) across vLLM minors: FusedMoE attrs moved between
+    releases, so resolve through a chain and fail LOUD, never silently."""
+    exp = moe.experts
+    n_exp = getattr(exp, "global_num_experts", None)
+    top_k = getattr(exp, "top_k", None)
+    mc = getattr(exp, "moe_config", None) or getattr(exp, "moe", None)
+    if n_exp is None and mc is not None:
+        n_exp = getattr(mc, "global_num_experts", None) or getattr(
+            mc, "num_experts", None)
+    if top_k is None and mc is not None:
+        top_k = getattr(mc, "experts_per_token", None) or getattr(
+            mc, "top_k", None)
+    if n_exp is None:
+        w = getattr(moe.gate, "weight", None)
+        if w is not None and getattr(w, "ndim", 0) == 2:
+            n_exp = w.shape[0]
+    if top_k is None and hf_config is not None:
+        top_k = getattr(hf_config, "num_experts_per_tok", None)
+    if n_exp is None or top_k is None:
+        have = sorted(k for k in vars(exp).keys() if not k.startswith("_"))
+        logger.error(
+            "PoC native: MoE found but dims unresolved (n_exp=%s top_k=%s); "
+            "experts type %s attrs: %s", n_exp, top_k,
+            type(exp).__name__, have[:40])
+        return None
+    return int(n_exp), int(top_k)
 
 
 def _patch_layer_forward(layer: nn.Module, state: "PoCNativeState", li: int):
