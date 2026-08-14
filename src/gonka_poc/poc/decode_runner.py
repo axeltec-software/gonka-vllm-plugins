@@ -291,10 +291,20 @@ def execute_poc_decode(
     stable_slots: Optional[Dict[str, torch.Tensor]] = (
         bundle["stable_slots"] if bundle else None)
     prof = [0.0, 0.0, 0.0, 0.0] if _PROFILE else None  # meta/embeds/fwd/snap
+    # Replay fence: builder.build() copies the step's FlashInfer plan into
+    # the SAME persistent device buffers every step. With graph replays the
+    # CPU races ahead, and step t+1's plan copy can land before replay t
+    # finished reading step t's plan — attention then sees one token too
+    # many (a not-yet-written slot): flaky snap flips and occasional
+    # illegal-memory-access. Fence the loop so the CPU never runs more than
+    # one step ahead of the GPU. Costs ~1ms/step against a ~60ms step.
+    replay_done = torch.cuda.Event()
     t_steps0 = time.perf_counter()
     for t in range(1, max_tokens + 1):
         if prof is not None:
             torch.cuda.synchronize(); _t0 = time.perf_counter()
+        if graph is not None:
+            replay_done.synchronize()
         steps_t.fill_(t)
         positions_step.fill_(seq_len + t - 1)
         embeds_t = generate_decode_inputs_gpu(base_seeds, prev_k, steps_t,
@@ -318,6 +328,7 @@ def execute_poc_decode(
             for buf, name in slot_pairs:
                 buf.copy_(slots_t[name])
             graph.replay()
+            replay_done.record()
             h = g_hidden
         else:
             if capture_wanted and t == 1:
