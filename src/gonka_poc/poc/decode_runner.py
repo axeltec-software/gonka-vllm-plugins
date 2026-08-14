@@ -65,6 +65,16 @@ _PROFILE = os.environ.get("POC_DECODE_PROFILE", "0") == "1"
 # kernels at the same addresses. Bit-neutral by construction; the ladder
 # (self-validation + golden tau-gate) re-verifies after every perf change.
 _CAPTURE = os.environ.get("POC_DECODE_CAPTURE", "1") == "1"
+
+# Process-lifetime graph cache, keyed by (batch, alloc_len). Two jobs:
+#  * replays across RPCs skip the ~seconds-long re-capture per chunk;
+#  * keeping graphs (and their private memory pools) alive prevents the
+#    known hazard of a dying CUDAGraph freeing its pool while another
+#    capture is in flight (observed as async illegal-memory-access when a
+#    128-batch capture followed dead 4/32-batch graphs).
+# Cached tensors (positions/ids/steps/slot clones/output) are the stable
+# addresses the captured kernels read; callers refresh them in place.
+_GRAPH_CACHE: Dict[tuple, dict] = {}
 POC_DECODE_PREFILL_CHUNK = int(os.environ.get("POC_DECODE_PREFILL_CHUNK", "128"))
 
 
@@ -204,6 +214,7 @@ def execute_poc_decode(
             f"{POC_DECODE_PREFILL_CHUNK} (MoE workspace is pre-sized; do not "
             f"resize after capture)")
 
+    t_pf0 = time.perf_counter()
     positions_pf = torch.arange(seq_len, dtype=torch.int64,
                                 device=device).repeat(batch)
     attn_pf, slots_pf = _create_v1_attn_metadata(
@@ -240,24 +251,36 @@ def execute_poc_decode(
     sph0 = random_pick_indices(block_hash, public_key, nonces,
                                hidden_size, SPHERE_DIM, device)
     snap_rows(last_pf, sph0, 0)
+    torch.cuda.synchronize()
+    t_pf = time.perf_counter() - t_pf0
 
     # ------------------------------------------------------------- decode --
-    positions_step = torch.empty(batch, dtype=torch.int64, device=device)
-    steps_t = torch.empty(batch, dtype=torch.int64, device=device)
-    ids_step = torch.zeros(batch, dtype=torch.int64, device=device)
-    # Graph state: captured on step 1 after a warmup call; replayed for the
-    # remaining steps. All tensors the captured kernels read live at stable
-    # addresses: positions/ids/steps (ours), state buffers (embeds, mask,
-    # route), the builder's persistent cudagraph plan buffers, and
-    # ``stable_slots`` — per-group clones the forward context carried at
-    # capture time, refreshed with copy_ each step (borrowed layouts are not
-    # arithmetic in the step index, so copy_, never add_).
-    graph = None
-    g_hidden = None
-    stable_slots: Optional[Dict[str, torch.Tensor]] = None
-    slot_pairs: List[tuple] = []   # (stable_group_tensor, representative layer)
+    # Graph bundle: captured once per (batch, alloc_len) per process on the
+    # first chunk's step 1 (after a warmup call; same inputs + same KV slot
+    # -> idempotent), then replayed for every remaining step of every chunk.
+    # All tensors the captured kernels read live at stable addresses:
+    # positions/ids/steps (cached with the graph), state buffers (embeds,
+    # mask, route), the builder's persistent cudagraph plan buffers, and the
+    # per-group slot clones refreshed with copy_ each step (borrowed layouts
+    # are not arithmetic in the step index, so copy_, never add_).
     capture_wanted = _CAPTURE and not _PROFILE
+    cache_key = (device.index, batch, alloc_len)
+    bundle = _GRAPH_CACHE.get(cache_key) if capture_wanted else None
+    if bundle is not None:
+        positions_step = bundle["positions"]
+        steps_t = bundle["steps"]
+        ids_step = bundle["ids"]
+    else:
+        positions_step = torch.empty(batch, dtype=torch.int64, device=device)
+        steps_t = torch.empty(batch, dtype=torch.int64, device=device)
+        ids_step = torch.zeros(batch, dtype=torch.int64, device=device)
+    graph = bundle["graph"] if bundle else None
+    g_hidden = bundle["hidden"] if bundle else None
+    slot_pairs = bundle["slot_pairs"] if bundle else []
+    stable_slots: Optional[Dict[str, torch.Tensor]] = (
+        bundle["stable_slots"] if bundle else None)
     prof = [0.0, 0.0, 0.0, 0.0] if _PROFILE else None  # meta/embeds/fwd/snap
+    t_steps0 = time.perf_counter()
     for t in range(1, max_tokens + 1):
         if prof is not None:
             torch.cuda.synchronize(); _t0 = time.perf_counter()
@@ -318,8 +341,14 @@ def execute_poc_decode(
                         if isinstance(g_hidden, tuple):
                             g_hidden = g_hidden[0]
                         h = g_hidden
+                        _GRAPH_CACHE[cache_key] = {
+                            "graph": graph, "hidden": g_hidden,
+                            "positions": positions_step, "steps": steps_t,
+                            "ids": ids_step, "slot_pairs": slot_pairs,
+                            "stable_slots": stable_slots,
+                        }
                         logger.info("PoC decode: step graph captured "
-                                    "(batch %d)", batch)
+                                    "(batch %d, alloc %d)", batch, alloc_len)
                     except Exception:
                         logger.exception(
                             "PoC decode: step-graph capture failed; falling "
@@ -347,6 +376,13 @@ def execute_poc_decode(
             1e3*prof[1]/max_tokens, 100*prof[1]/tot,
             1e3*prof[2]/max_tokens, 100*prof[2]/tot,
             1e3*prof[3]/max_tokens, 100*prof[3]/tot)
+
+    torch.cuda.synchronize()
+    t_steps = time.perf_counter() - t_steps0
+    logger.info("PoC decode chunk: %d nonces, prefill %.2fs, %d steps %.2fs "
+                "(%.1f ms/step)%s", batch, t_pf, max_tokens, t_steps,
+                1e3 * t_steps / max(1, max_tokens),
+                "" if _GRAPH_CACHE else " [no graph]")
 
     state.clear()
 

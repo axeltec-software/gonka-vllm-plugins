@@ -654,9 +654,20 @@ async def _generate_decode(request: Request, body: PoCGenerateRequest,
     mismatch_total = 0
     steps_total = 0
 
+    # Equal-size chunks (ceil split): a trailing 16-nonce chunk pays the same
+    # 257 sequential steps as a full one, and uniform batches reuse one
+    # captured step graph across the whole round.
+    n_chunks = max(1, -(-total // chunk_size))
+    base, rem = divmod(total, n_chunks)
+    bounds = []
+    off = 0
+    for ci in range(n_chunks):
+        size = base + (1 if ci < rem else 0)
+        bounds.append((off, off + size))
+        off += size
     async with poc_reservation(engine_client, chunk_size, alloc_len) as lease:
-        for i in range(0, total, chunk_size):
-            chunk = body.nonces[i:i + chunk_size]
+        for lo, hi in bounds:
+            chunk = body.nonces[lo:hi]
             while _is_generation_active(app_id):
                 await asyncio.sleep(GENERATION_ACTIVE_POLL_SEC)
             kwargs = dict(

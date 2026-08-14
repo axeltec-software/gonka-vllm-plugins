@@ -222,12 +222,19 @@ class GenerateQueue:
         mismatch_total = 0
         steps_total = 0
         validating = job.enforced_k_steps is not None
+        n_eq = max(1, -(-total_nonces // chunk_size))
+        base, rem = divmod(total_nonces, n_eq)
+        bounds = []
+        off = 0
+        for ci in range(n_eq):
+            size = base + (1 if ci < rem else 0)
+            bounds.append((off, off + size))
+            off += size
         async with poc_reservation(
             job.engine_client, chunk_size, job.seq_len + job.max_tokens,
         ) as lease:
-            for i in range(0, total_nonces, chunk_size):
-                chunk = job.nonces[i:i + chunk_size]
-                chunk_idx = i // chunk_size
+            for chunk_idx, (lo, hi) in enumerate(bounds):
+                chunk = job.nonces[lo:hi]
 
                 while True:
                     if self._stop_event.is_set():
