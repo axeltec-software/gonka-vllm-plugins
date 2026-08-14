@@ -206,9 +206,9 @@ class GenerateQueue:
     
     async def _process_job(self, job: GenerateJob) -> Dict[str, Any]:
         """Process a single generate job (decode-PoC chunks)."""
-        from .decode_runner import POC_DECODE_PREFILL_CHUNK
-        chunk_size = min(job.batch_size or POC_DECODE_PREFILL_CHUNK,
-                         POC_DECODE_PREFILL_CHUNK)
+        from .decode_runner import POC_DECODE_MAX_BATCH
+        chunk_size = min(job.batch_size or POC_DECODE_MAX_BATCH,
+                         POC_DECODE_MAX_BATCH)
         total_nonces = len(job.nonces)
         n_chunks = (total_nonces + chunk_size - 1) // chunk_size
         logger.info(f"PoC queue job {job.request_id[:8]}: {total_nonces} nonces, batch_size={job.batch_size}, chunks={n_chunks}")

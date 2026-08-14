@@ -624,7 +624,7 @@ async def _generate_decode(request: Request, body: PoCGenerateRequest,
     prefill of a chunk must fit the pre-sized MoE workspace (v0.1.3 lesson);
     batch_size == 0 means AUTO (decision #5).
     """
-    from gonka_poc.poc.decode_runner import POC_DECODE_PREFILL_CHUNK
+    from gonka_poc.poc.decode_runner import POC_DECODE_MAX_BATCH
     from .data import fraud_test
 
     seq_len = body.params.seq_len
@@ -645,8 +645,11 @@ async def _generate_decode(request: Request, body: PoCGenerateRequest,
                 status_code=400,
                 detail=f"enforced_k_steps missing for nonces {missing[:5]}...")
 
-    chunk_size = body.batch_size if body.batch_size > 0 else POC_DECODE_PREFILL_CHUNK
-    chunk_size = min(chunk_size, POC_DECODE_PREFILL_CHUNK)
+    # batch_size caps ONE RPC's nonce count (prefill sub-chunking happens
+    # inside the runner); 0 = AUTO. The joint decode batch is what amortizes
+    # MoE weight traffic — bigger is faster until KV runs out.
+    chunk_size = body.batch_size if body.batch_size > 0 else POC_DECODE_MAX_BATCH
+    chunk_size = min(chunk_size, POC_DECODE_MAX_BATCH)
 
     total = len(body.nonces)
     start_time = time.time()

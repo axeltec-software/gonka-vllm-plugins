@@ -131,28 +131,33 @@ def _borrowed_layout(
     return slot_mapping, block_table
 
 
-def _inplace_layout(batch_size, seq_len, g_block, device):
+def _inplace_layout(batch_size, seq_len, g_block, device, row_offset=0):
     """Legacy in-place slot_mapping + block_table over blocks ``0..N``.
 
     slot = (seq_idx*blocks_per_seq + t//g_block)*g_block + t%g_block
          = seq_idx*padded_len + t   (contiguous per sequence, padded to
     a block multiple), so the mapping vectorizes to two aranges.
+
+    ``row_offset`` shifts the whole layout down by that many sequences —
+    the split-prefill path runs sub-chunks of one big batch, and sub-chunk
+    rows must land in the same blocks the joint decode phase will read
+    (offset 0 == the historical layout, bit-path unchanged).
     """
     blocks_per_seq = math.ceil(seq_len / g_block)
     padded = blocks_per_seq * g_block
-    base = (torch.arange(batch_size, dtype=torch.long, device=device)
-            * padded).repeat_interleave(seq_len)
+    base = ((torch.arange(batch_size, dtype=torch.long, device=device)
+             + row_offset) * padded).repeat_interleave(seq_len)
     slot_mapping = base + torch.arange(
         seq_len, dtype=torch.long, device=device).repeat(batch_size)
-    block_table = torch.arange(
+    block_table = (torch.arange(
         batch_size * blocks_per_seq, dtype=torch.int32, device=device
-    ).view(batch_size, blocks_per_seq)
+    ) + row_offset * blocks_per_seq).view(batch_size, blocks_per_seq)
     return slot_mapping, block_table
 
 
 def _create_v1_attn_metadata(batch_size, seq_len, device, worker, positions,
                              borrowed_block_ids=None, borrowed_stripe=None,
-                             alloc_len=None, decode_step=None):
+                             alloc_len=None, decode_step=None, row_offset=0):
     """Create attention metadata, built independently for every attention group.
 
     Models may register KV cache groups with DIFFERENT block sizes (e.g.
@@ -209,12 +214,14 @@ def _create_v1_attn_metadata(batch_size, seq_len, device, worker, positions,
 
     def _layout(g_block, m_block):
         if borrowed_block_ids is not None:
+            # Sub-chunk callers pass the SLICE of the lease covering their
+            # rows, so no offset is needed here.
             slot_all, table = _borrowed_layout(
                 batch_size, layout_len, g_block, m_block,
                 borrowed_block_ids, int(borrowed_stripe or 0), device)
         else:
             slot_all, table = _inplace_layout(batch_size, layout_len, g_block,
-                                              device)
+                                              device, row_offset=row_offset)
         if alloc_len is None:
             return slot_all, table
         # slot_all covers layout_len slots per row; cut the piece this forward

@@ -76,6 +76,10 @@ _CAPTURE = os.environ.get("POC_DECODE_CAPTURE", "1") == "1"
 # addresses the captured kernels read; callers refresh them in place.
 _GRAPH_CACHE: Dict[tuple, dict] = {}
 POC_DECODE_PREFILL_CHUNK = int(os.environ.get("POC_DECODE_PREFILL_CHUNK", "128"))
+# Upper bound for one RPC's nonce count (the joint-decode batch). KV must
+# hold batch x (seq_len+max_tokens) tokens; the reservation layer degrades
+# to lease=None (abort-based in-place) when the pool cannot cover it.
+POC_DECODE_MAX_BATCH = int(os.environ.get("POC_DECODE_MAX_BATCH", "512"))
 
 
 @torch.inference_mode()
@@ -208,46 +212,53 @@ def execute_poc_decode(
             q_kept[step] = q.detach().to(torch.float16).cpu()
 
     # ------------------------------------------------------------ prefill --
-    if batch * seq_len > POC_DECODE_PREFILL_CHUNK * seq_len:
-        raise ValueError(
-            f"decode-PoC chunk {batch} nonces exceeds prefill workspace bound "
-            f"{POC_DECODE_PREFILL_CHUNK} (MoE workspace is pre-sized; do not "
-            f"resize after capture)")
-
-    t_pf0 = time.perf_counter()
-    positions_pf = torch.arange(seq_len, dtype=torch.int64,
-                                device=device).repeat(batch)
-    attn_pf, slots_pf = _create_v1_attn_metadata(
-        batch, seq_len, device, worker, positions_pf,
-        borrowed_block_ids=borrowed_block_ids,
-        borrowed_stripe=borrowed_stripe,
-        alloc_len=alloc_len)
-    embeds_pf = generate_inputs(block_hash, public_key, nonces,
-                                dim=hidden_size, seq_len=seq_len,
-                                device=device, dtype=dtype)
-
+    # Split prefill / joint decode: the MoE workspace bound applies to the
+    # PREFILL token count only (sub-chunks of <= POC_DECODE_PREFILL_CHUNK
+    # nonces x seq_len rows); the decode phase then runs the WHOLE batch one
+    # step at a time (a few hundred rows), which amortizes the full-scatter
+    # expert-weight traffic exactly like the 0.20 engine did with its single
+    # round-wide decode batch. Each sub-chunk writes the same blocks the
+    # joint phase reads: lease slice for borrowed layouts, row_offset for
+    # the in-place fallback.
     if not getattr(state, "has_embed_patch", False):
         raise RuntimeError(
             "decode-PoC: embed_tokens patch missing — the compiled engine "
             "path needs in-model embedding swap (eager is not a mode)")
 
-    # ENGINE signature: input_ids tensor + inputs_embeds None — the exact
-    # shape @support_torch_compile was compiled under. Synthetic embeds are
-    # staged into state and swapped in by the embed patch INSIDE the graph.
-    ids_pf = torch.zeros(batch * seq_len, dtype=torch.int64, device=device)
-    state.set_rows(block_hash, batch * seq_len)
-    state.set_routing(block_hash, nonces, seq_len, 0)
-    state.set_embeds(embeds_pf.view(-1, hidden_size))
-
-    with set_forward_context(attn_pf, vllm_config,
-                             num_tokens=batch * seq_len,
-                             slot_mapping=slots_pf,
-                             skip_compiled=_SKIP_COMPILED):
-        hidden = model(input_ids=ids_pf, positions=positions_pf,
-                       intermediate_tensors=None, inputs_embeds=None)
-    if isinstance(hidden, tuple):
-        hidden = hidden[0]
-    last_pf = hidden.view(batch, seq_len, -1)[:, -1, :]
+    t_pf0 = time.perf_counter()
+    last_pf = torch.empty(batch, hidden_size, device=device, dtype=dtype)
+    stripe = int(borrowed_stripe or 0)
+    for off in range(0, batch, POC_DECODE_PREFILL_CHUNK):
+        sub_nonces = nonces[off:off + POC_DECODE_PREFILL_CHUNK]
+        b = len(sub_nonces)
+        positions_pf = torch.arange(seq_len, dtype=torch.int64,
+                                    device=device).repeat(b)
+        sub_lease = (borrowed_block_ids[off * stripe:(off + b) * stripe]
+                     if borrowed_block_ids is not None else None)
+        attn_pf, slots_pf = _create_v1_attn_metadata(
+            b, seq_len, device, worker, positions_pf,
+            borrowed_block_ids=sub_lease,
+            borrowed_stripe=borrowed_stripe,
+            alloc_len=alloc_len, row_offset=off)
+        embeds_pf = generate_inputs(block_hash, public_key, sub_nonces,
+                                    dim=hidden_size, seq_len=seq_len,
+                                    device=device, dtype=dtype)
+        # ENGINE signature: input_ids tensor + inputs_embeds None — the exact
+        # shape @support_torch_compile was compiled under. Synthetic embeds
+        # are staged and swapped in by the embed patch INSIDE the graph.
+        ids_pf = torch.zeros(b * seq_len, dtype=torch.int64, device=device)
+        state.set_rows(block_hash, b * seq_len)
+        state.set_routing(block_hash, sub_nonces, seq_len, 0)
+        state.set_embeds(embeds_pf.view(-1, hidden_size))
+        with set_forward_context(attn_pf, vllm_config,
+                                 num_tokens=b * seq_len,
+                                 slot_mapping=slots_pf,
+                                 skip_compiled=_SKIP_COMPILED):
+            hidden = model(input_ids=ids_pf, positions=positions_pf,
+                           intermediate_tensors=None, inputs_embeds=None)
+        if isinstance(hidden, tuple):
+            hidden = hidden[0]
+        last_pf[off:off + b] = hidden.view(b, seq_len, -1)[:, -1, :]
     sph0 = random_pick_indices(block_hash, public_key, nonces,
                                hidden_size, SPHERE_DIM, device)
     snap_rows(last_pf, sph0, 0)
