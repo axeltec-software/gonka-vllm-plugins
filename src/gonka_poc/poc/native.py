@@ -148,7 +148,12 @@ class PoCNativeState:
         n = len(nonces) * tokens_per_nonce
         base_key = (block_hash, tuple(nonces), tokens_per_nonce)
         if base_key != self._route_key:
-            for li, buf in enumerate(self._route_base):
+            # ``li`` is the GLOBAL decoder-layer index (phase-0 decision #4:
+            # same numbering as the Householder seeds). For all-MoE stacks
+            # (MiniMax) it equals the discovery order, so bits are unchanged;
+            # for dense-prefixed stacks (DeepSeek family) it pins the seed to
+            # the physical layer, not to "which MoE in order".
+            for li, buf in self._route_base:
                 vals = torch.tensor(
                     [_seed_from_string(route_base_seed(block_hash, nz, li))
                      for nz in nonces],
@@ -225,11 +230,12 @@ def attach_native_poc(model: nn.Module, hidden_size: int, max_rows: int,
         dims = _moe_dims(moe, getattr(model, "config", None))
         if dims is None:
             continue
-        n_exp, top_k = dims
+        n_exp, top_k, n_group, topk_group = dims
         route_base = torch.zeros(max_rows, dtype=torch.int64, device=device)
-        state._route_base.append(route_base)
-        state.router_meta.append((n_exp, top_k))
-        _patch_gate_forward(moe, state, route_base, n_exp, top_k)
+        state._route_base.append((li, route_base))
+        state.router_meta.append((n_exp, top_k, n_group, topk_group))
+        _patch_gate_forward(moe, state, route_base, n_exp, top_k,
+                            n_group, topk_group)
 
     logger.info("PoC native attached: %d layers patched, %d MoE gates seeded, "
                 "embed patch %s, route window %d", len(layers),
@@ -297,7 +303,20 @@ def _moe_dims(moe: nn.Module, hf_config) -> Optional[tuple]:
             "experts type %s attrs: %s", n_exp, top_k,
             type(exp).__name__, have[:40])
         return None
-    return int(n_exp), int(top_k)
+    # Grouped routers (DeepSeek family): n_group/topk_group from the experts
+    # module, falling back to the HF config; 1/1 = flat router (MiniMax).
+    n_group = getattr(exp, "num_expert_group", None)
+    topk_group = getattr(exp, "topk_group", None)
+    if n_group is None and mc is not None:
+        n_group = getattr(mc, "num_expert_group", None) or getattr(
+            mc, "n_group", None)
+    if topk_group is None and mc is not None:
+        topk_group = getattr(mc, "topk_group", None)
+    if n_group is None and hf_config is not None:
+        n_group = getattr(hf_config, "n_group", None)
+    if topk_group is None and hf_config is not None:
+        topk_group = getattr(hf_config, "topk_group", None)
+    return int(n_exp), int(top_k), int(n_group or 1), int(topk_group or 1)
 
 
 def _patch_layer_forward(layer: nn.Module, state: "PoCNativeState", li: int):
@@ -338,7 +357,8 @@ def _patch_layer_forward(layer: nn.Module, state: "PoCNativeState", li: int):
 
 
 def _patch_gate_forward(moe: nn.Module, state: "PoCNativeState",
-                        route_base: torch.Tensor, n_experts: int, top_k: int):
+                        route_base: torch.Tensor, n_experts: int, top_k: int,
+                        n_group: int = 1, topk_group: int = 1):
     """Override the MoE gate's logits with seeded logits on PoC rows.
 
     Class-level patch (see _patch_embed_forward); the per-gate route-base
@@ -358,10 +378,10 @@ def _patch_gate_forward(moe: nn.Module, state: "PoCNativeState",
             n = logits.shape[0]
             if n > st.mask.shape[0]:
                 return out  # chat batch beyond PoC buffers: untouched
-            ne, tk = self._poc_dims
+            ne, tk, ng, tkg = self._poc_dims
             forced = expert_logits_from_base(
                 self._poc_base[:n], st.route_step[:n], ne, tk,
-                logits.device).to(logits.dtype)
+                logits.device, n_group=ng, topk_group=tkg).to(logits.dtype)
             logits = torch.where(st.mask[:n], forced, logits)
             return (logits, *out[1:]) if isinstance(out, tuple) else logits
 
@@ -369,4 +389,5 @@ def _patch_gate_forward(moe: nn.Module, state: "PoCNativeState",
         cls._poc_class_patched = True
     gate._poc_state = state
     gate._poc_base = route_base
-    gate._poc_dims = (int(n_experts), int(top_k))
+    gate._poc_dims = (int(n_experts), int(top_k), int(n_group),
+                      int(topk_group))

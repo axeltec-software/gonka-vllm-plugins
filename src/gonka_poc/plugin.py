@@ -67,6 +67,13 @@ def register() -> None:
             "MiniMaxM2ForCausalLM",
             "gonka_poc.models.minimax_m2_poc:MiniMaxM2ForCausalLMPoC")
         logger.info("gonka_poc: MiniMaxM2ForCausalLM overridden with PoC-wrapped class")
+        # DeepSeek family (covers Kimi K-series — same declared architecture).
+        # Subclasses are built dynamically against whatever base classes this
+        # vLLM build ships, so register by class object, not qualname.
+        from gonka_poc.models.deepseek_poc import build_poc_subclasses
+        for arch, sub in build_poc_subclasses():
+            ModelRegistry.register_model(arch, sub)
+            logger.info("gonka_poc: %s overridden with PoC-wrapped class", arch)
     except Exception:  # pragma: no cover — non-vllm import contexts
         logger.exception("gonka_poc: model registry override failed")
 

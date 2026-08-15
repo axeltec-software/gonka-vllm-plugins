@@ -533,6 +533,113 @@ def _forced_logits(seed: torch.Tensor, n_experts: int, top_k: int,
     return logits
 
 
+# Grouped top-k forcing (DeepSeek family; Kimi shares the architecture).
+# CONSENSUS constants and formula — phase-0 spec, approved 15.08.2026:
+# stage G picks topk_group groups, stage E picks top_k experts INSIDE the
+# picked groups with a coverage guarantee (>=1 expert per picked group —
+# an empty picked group would tie at the -1e4 floor with losing groups and
+# make the engine's group selection nondeterministic).
+_SALT_ROUTE_GROUP = 0x3A
+_SALT_ROUTE_EXPERT = 0x5C
+
+
+def _forced_logits_grouped(seed: torch.Tensor, n_experts: int, top_k: int,
+                           n_group: int, topk_group: int,
+                           device: torch.device) -> torch.Tensor:
+    """Seeded expert selection compatible with grouped top-k routers.
+
+    Plain _forced_logits spreads the picks over ALL experts; a grouped router
+    first keeps only ``topk_group`` groups, so off-group picks could never be
+    selected and the -1e4 ties would leave the outcome to kernel order. Two
+    seeded stages fix that:
+
+      G: partial Fisher-Yates over ``n_group`` from seed_g -> picked groups;
+      E: one guaranteed expert per picked group (coverage), then the
+         remaining ``top_k - topk_group`` picks over the rest of the picked
+         groups' experts, all from seed_e.
+
+    seed_g/seed_e derive from the (base ^ step) seed with dedicated salts, so
+    neither stage correlates with the other or with the flat formula. Forced
+    values are ``top_k..1`` on chosen experts and -1e4 elsewhere: gaps are
+    orders of magnitude beyond |e_score_correction_bias|, so the bias can
+    shift scores but never the selected set; expert WEIGHTS derive from these
+    constants (deterministic), and intra-top-k order does not affect the
+    weighted sum. Integer-only selection — bit-identical on any hardware,
+    eager or graph.
+    """
+    b = seed.shape[0]
+    group_size = n_experts // n_group
+    if n_group * group_size != n_experts:
+        raise ValueError(
+            f"grouped forcing: n_experts {n_experts} not divisible by "
+            f"n_group {n_group}")
+    if top_k < topk_group:
+        raise ValueError(
+            f"grouped forcing: top_k {top_k} < topk_group {topk_group} — "
+            f"coverage guarantee impossible; needs a protocol decision")
+    seed_g = _batched_murmur3_32(
+        torch.full((b, 1), _SALT_ROUTE_GROUP, dtype=torch.int32, device=device),
+        seed)
+    seed_e = _batched_murmur3_32(
+        torch.full((b, 1), _SALT_ROUTE_EXPERT, dtype=torch.int32, device=device),
+        seed)
+
+    # -- stage G: pick topk_group distinct groups (partial Fisher-Yates) ----
+    gperm = torch.arange(n_group, device=device, dtype=torch.int64
+                         ).unsqueeze(0).repeat(b, 1)
+    for i in range(topk_group):
+        j = i + _batched_murmur3_32(
+            torch.full((b, 1), i, dtype=torch.int32, device=device),
+            seed_g) % (n_group - i)
+        gi = gperm[:, i:i + 1].clone()
+        gperm[:, i:i + 1] = gperm.gather(1, j)
+        gperm.scatter_(1, j, gi)
+    groups = gperm[:, :topk_group]                       # [B, topk_group]
+
+    # -- stage E over the picked groups' expert slots ------------------------
+    # Virtual layout: slot (g, r) = expert groups[g]*group_size + r. Coverage
+    # first: for picked group g (g < topk_group) pick one in-group offset;
+    # then the remaining top_k - topk_group picks run a partial Fisher-Yates
+    # over the remaining topk_group*(group_size-1) virtual slots.
+    off = _batched_murmur3_32(
+        torch.arange(topk_group, dtype=torch.int32, device=device
+                     ).unsqueeze(0).repeat(b, 1),
+        seed_e) % group_size                              # [B, topk_group]
+    cover = groups * group_size + off                     # [B, topk_group]
+
+    rest = top_k - topk_group
+    picks = [cover]
+    if rest > 0:
+        # Remaining slots per picked group: group_size-1 offsets, skipping
+        # the covered one. Virtual index v in [0, topk_group*(group_size-1)):
+        #   g = v // (group_size-1); r0 = v % (group_size-1)
+        #   r  = r0 + (r0 >= off[g])           (skip the covered offset)
+        m = topk_group * (group_size - 1)
+        vperm = torch.arange(m, device=device, dtype=torch.int64
+                             ).unsqueeze(0).repeat(b, 1)
+        for i in range(rest):
+            j = i + _batched_murmur3_32(
+                torch.full((b, 1), 0x100 + i, dtype=torch.int32, device=device),
+                seed_e) % (m - i)
+            vi = vperm[:, i:i + 1].clone()
+            vperm[:, i:i + 1] = vperm.gather(1, j)
+            vperm.scatter_(1, j, vi)
+        v = vperm[:, :rest]                               # [B, rest]
+        g = v // (group_size - 1)
+        r0 = v % (group_size - 1)
+        goff = off.gather(1, g)
+        r = r0 + (r0 >= goff).to(torch.int64)
+        picks.append(groups.gather(1, g) * group_size + r)
+    chosen = torch.cat(picks, dim=1)                      # [B, top_k]
+
+    logits = torch.full((b, n_experts), -1.0e4, device=device,
+                        dtype=torch.float32)
+    logits.scatter_(1, chosen,
+                    torch.arange(top_k, 0, -1, device=device,
+                                 dtype=torch.float32).unsqueeze(0).expand(b, -1))
+    return logits
+
+
 def _forced_logits_windowed(seed: torch.Tensor, steps: torch.Tensor, n_experts: int,
                             top_k: int, window: int, device: torch.device) -> torch.Tensor:
     """Seeded expert selection restricted to a step-rotating WINDOW of ``window`` experts.
@@ -571,13 +678,20 @@ def route_base_seed(block_hash: str, nonce: int, layer: int) -> str:
 
 def expert_logits_from_base(base_ints: torch.Tensor, steps: torch.Tensor,
                             n_experts: int, top_k: int,
-                            device: torch.device) -> torch.Tensor:
+                            device: torch.device,
+                            n_group: int = 1,
+                            topk_group: int = 1) -> torch.Tensor:
     """Per-row forced router logits: fold the decode ``step`` into the cached base seed
     ON GPU, then the shared _forced_logits selection. ``base_ints``/``steps`` are [B]
     int64; returns [B, n_experts]. All integer (bit-exact cross-HW), no host loop, no
     device->host sync. Equivalent per (row, layer) to seeded_experts()."""
     seed = _batched_murmur3_32(steps.view(-1, 1).to(torch.int32),
                                base_ints.view(-1, 1))               # [B,1] = fold step into base
+    if n_group > 1:
+        # Grouped router (DeepSeek family): the two-stage formula; the flat
+        # window path below stays byte-identical for n_group <= 1 (MiniMax).
+        return _forced_logits_grouped(seed, n_experts, top_k, n_group,
+                                      topk_group, device)
     if _ROUTE_WINDOW and _ROUTE_WINDOW < n_experts:
         return _forced_logits_windowed(seed, steps.view(-1, 1), n_experts, top_k,
                                        _ROUTE_WINDOW, device)
