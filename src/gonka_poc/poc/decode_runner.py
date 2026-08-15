@@ -154,6 +154,62 @@ def _build_step_meta(worker, sm, batch, kv_len, positions, alloc_len,
     return out
 
 
+def _capture_step_graph(model, ids_step, positions_step, device, tp_group,
+                        dist, replay_done, batch, alloc_len):
+    """Capture the decode-step forward into a private CUDA graph on TP-safe
+    rails. Returns (graph, hidden) or (None, None) on failure.
+
+    THE TP FIX: model() contains TP all-reduces; capturing them raw corrupts
+    the NCCL communicator (async illegal-memory-access on workers — TP=1 has
+    no collectives, hence it worked there). vLLM's ``graph_capture`` context
+    switches the TP/PP communicators to their graph-capturable path and runs
+    on a private stream; capture MUST happen inside it. Barriers keep ranks
+    in lockstep so a warmup collective on one rank never pairs with a capture
+    collective on another.
+
+    Discipline: the forward is a REPLAY even on the capture step (the
+    capture-pass execution itself proved bit-divergent); warmup + capture +
+    replay all write the same bytes (same inputs, same KV slot).
+    """
+    from vllm.distributed.parallel_state import graph_capture as _vllm_gc
+    tp = tp_group.world_size > 1
+    try:
+        if tp:
+            dist.barrier(group=tp_group.cpu_group)
+        with _vllm_gc(device) as _gc:
+            stream = _gc.stream
+            with torch.cuda.stream(stream):
+                # Second warmup on the capture stream: finishes DeepGEMM lazy
+                # JIT and primes plan buffers before recording.
+                model(input_ids=ids_step, positions=positions_step,
+                      intermediate_tensors=None, inputs_embeds=None)
+                torch.cuda.synchronize()
+                if tp:
+                    dist.barrier(group=tp_group.cpu_group)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=stream):
+                    g_hidden = model(input_ids=ids_step,
+                                     positions=positions_step,
+                                     intermediate_tensors=None,
+                                     inputs_embeds=None)
+        if isinstance(g_hidden, tuple):
+            g_hidden = g_hidden[0]
+        torch.cuda.synchronize()
+        if tp:
+            dist.barrier(group=tp_group.cpu_group)
+        graph.replay()
+        replay_done.record()
+        logger.info("PoC decode: step graph captured (batch %d, alloc %d, "
+                    "tp=%d)", batch, alloc_len, tp_group.world_size)
+        return graph, g_hidden
+    except Exception:
+        logger.exception("PoC decode: step-graph capture failed; per-step "
+                         "compiled fallback")
+        return None, None
+
+
+
+
 @torch.inference_mode()
 def execute_poc_decode(
     worker,
@@ -224,6 +280,28 @@ def execute_poc_decode(
     pp_group = get_pp_group()
     if pp_group.world_size > 1:
         raise RuntimeError("decode-PoC: PP > 1 not supported in this revision")
+
+    # --- TP consensus gate (tech-debt #2): validate inputs on EVERY rank and
+    # agree via an all-reduce BEFORE the collective forward phase. A rank that
+    # rejects (bad shapes / empty batch / lease too small) must not bail while
+    # the others enter NCCL and hang forever. If any rank is unhealthy, all
+    # raise together — collective_rpc then surfaces one clean error.
+    local_ok = 1
+    reason = ""
+    if batch <= 0:
+        local_ok, reason = 0, "empty batch"
+    elif borrowed_block_ids is not None and len(borrowed_block_ids) < batch:
+        local_ok, reason = 0, "lease smaller than batch"
+    if tp_group.world_size > 1:
+        flag = torch.tensor([local_ok], dtype=torch.int32, device=device)
+        dist.all_reduce(flag, group=tp_group.device_group)
+        if int(flag.item()) != tp_group.world_size:
+            raise RuntimeError(
+                f"decode-PoC: TP consensus gate failed (this rank: "
+                f"{reason or 'ok'}); aborting on all ranks to avoid a "
+                f"half-entered collective")
+    elif not local_ok:
+        raise RuntimeError(f"decode-PoC: input rejected: {reason}")
 
     # --- model wrappers: pre-compile (registry class) or late attach -------
     # The registry-wrapped model carries state from construction (wrappers are
@@ -416,59 +494,16 @@ def execute_poc_decode(
                 h = model(input_ids=ids_step, positions=positions_step,
                           intermediate_tensors=None, inputs_embeds=None)
                 if capture_wanted and t == 1:
-                    # TP>1: capture is a collective act — every rank records
-                    # the same NCCL ops into its graph, so ranks must enter
-                    # warmup/capture in lockstep. Without the barriers one
-                    # rank's warmup collective pairs with another rank's
-                    # capture collective and the communicator corrupts
-                    # (async illegal-memory-access on TP workers).
-                    if tp_group.world_size > 1:
-                        dist.barrier(group=tp_group.cpu_group)
-                    # Second warmup: DeepGEMM JIT finishes lazy module loads
-                    # on the first call of a shape; capturing over a
-                    # cold-JIT call died with CUDA_ERROR_ILLEGAL_INSTRUCTION
-                    # on fresh boots. Same inputs + same KV slot = same
-                    # bytes, so the extra call is idempotent.
-                    h = model(input_ids=ids_step, positions=positions_step,
-                              intermediate_tensors=None, inputs_embeds=None)
-                    # vLLM-style capture discipline: the capture pass only
-                    # RECORDS the graph — its output is discarded and step 1
-                    # is then executed as a REPLAY, so every step of every
-                    # RPC runs through the identical replay path (the
-                    # capture-pass execution itself proved bit-divergent).
-                    # Same inputs + same KV slot => the warmup, capture and
-                    # replay writes of step 1 all land the same bytes.
-                    try:
-                        if tp_group.world_size > 1:
-                            torch.cuda.synchronize()
-                            dist.barrier(group=tp_group.cpu_group)
-                        graph = torch.cuda.CUDAGraph()
-                        with torch.cuda.graph(graph):
-                            g_hidden = model(input_ids=ids_step,
-                                             positions=positions_step,
-                                             intermediate_tensors=None,
-                                             inputs_embeds=None)
-                        if isinstance(g_hidden, tuple):
-                            g_hidden = g_hidden[0]
-                        if tp_group.world_size > 1:
-                            torch.cuda.synchronize()
-                            dist.barrier(group=tp_group.cpu_group)
-                        graph.replay()
-                        replay_done.record()
+                    graph, g_hidden = _capture_step_graph(
+                        model, ids_step, positions_step, device, tp_group,
+                        dist, replay_done, batch, alloc_len)
+                    if graph is not None:
                         h = g_hidden
                         _GRAPH_CACHE[cache_key] = {
                             "graph": graph, "hidden": g_hidden,
                             "positions": positions_step, "steps": steps_t,
                             "ids": ids_step, "step_meta": step_meta,
                         }
-                        logger.info("PoC decode: step graph captured "
-                                    "(batch %d, alloc %d)", batch, alloc_len)
-                    except Exception:
-                        logger.exception(
-                            "PoC decode: step-graph capture failed; falling "
-                            "back to per-step compiled calls")
-                        graph = None
-                        g_hidden = None
         if isinstance(h, tuple):
             h = h[0]
         if prof is not None:
