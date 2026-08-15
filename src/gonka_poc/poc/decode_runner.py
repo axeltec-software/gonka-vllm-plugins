@@ -416,6 +416,14 @@ def execute_poc_decode(
                 h = model(input_ids=ids_step, positions=positions_step,
                           intermediate_tensors=None, inputs_embeds=None)
                 if capture_wanted and t == 1:
+                    # TP>1: capture is a collective act — every rank records
+                    # the same NCCL ops into its graph, so ranks must enter
+                    # warmup/capture in lockstep. Without the barriers one
+                    # rank's warmup collective pairs with another rank's
+                    # capture collective and the communicator corrupts
+                    # (async illegal-memory-access on TP workers).
+                    if tp_group.world_size > 1:
+                        dist.barrier(group=tp_group.cpu_group)
                     # Second warmup: DeepGEMM JIT finishes lazy module loads
                     # on the first call of a shape; capturing over a
                     # cold-JIT call died with CUDA_ERROR_ILLEGAL_INSTRUCTION
@@ -431,6 +439,9 @@ def execute_poc_decode(
                     # Same inputs + same KV slot => the warmup, capture and
                     # replay writes of step 1 all land the same bytes.
                     try:
+                        if tp_group.world_size > 1:
+                            torch.cuda.synchronize()
+                            dist.barrier(group=tp_group.cpu_group)
                         graph = torch.cuda.CUDAGraph()
                         with torch.cuda.graph(graph):
                             g_hidden = model(input_ids=ids_step,
@@ -439,6 +450,9 @@ def execute_poc_decode(
                                              inputs_embeds=None)
                         if isinstance(g_hidden, tuple):
                             g_hidden = g_hidden[0]
+                        if tp_group.world_size > 1:
+                            torch.cuda.synchronize()
+                            dist.barrier(group=tp_group.cpu_group)
                         graph.replay()
                         replay_done.record()
                         h = g_hidden
