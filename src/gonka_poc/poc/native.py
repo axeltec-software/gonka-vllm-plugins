@@ -10,10 +10,10 @@ into the plugin, trimmed to what the plugin-side decode loop actually needs:
     noise-prone hidden state);
   * ``PoCNativeState``   — address-stable buffers (reflection vectors, row
     mask, per-layer route bases, shared step buffer) updated IN PLACE, so a
-    captured CUDA graph reads live values (migration rule: eager is not an
+    captured CUDA graph reads live values (design rule: eager is not an
     execution mode; the step function must be capture-ready from day one).
 
-Dropped relative to 0.20 (inventory DROP verdicts, roles covered elsewhere):
+Dropped relative to 0.20 (their roles are covered elsewhere):
 ``PoCEmbeddingWrapper`` (the loop feeds ``inputs_embeds`` directly),
 ``PoCSnapWrapper`` (the loop snaps the returned hidden inside its own step
 function), TP-rank divergence assertion (single-driver RPC path).
@@ -68,7 +68,7 @@ class PoCNativeState:
         # Reflection vectors are BROADCAST [1, hidden]: one chunk carries one
         # block_hash, so a per-token-row [rows, hidden] buffer (12+ GiB at the
         # 128-nonce prefill chunk) is pure waste. per_nonce_reflection would
-        # need per-row vectors — deferred (not in the golden scope), guarded
+        # need per-row vectors — deferred (not in the consensus configuration), guarded
         # in set_rows.
         self.vectors: List[torch.Tensor] = [
             torch.zeros(1, hidden_size, device=device, dtype=dtype)
@@ -78,7 +78,7 @@ class PoCNativeState:
         # Synthetic-embedding buffer: the compiled path is entered with the
         # ENGINE signature (input_ids tensor, inputs_embeds None) and the
         # embed_tokens patch swaps in these rows by mask — the 0.20
-        # PoCEmbeddingWrapper role (its DROP verdict in the inventory was
+        # PoCEmbeddingWrapper role (dropping the wrapper outright proved
         # wrong: feeding inputs_embeds from outside forces the eager path).
         self.embeds = torch.zeros(max_rows, hidden_size, device=device,
                                   dtype=dtype)
@@ -112,13 +112,14 @@ class PoCNativeState:
         """Broadcast reflection vectors for ONE block_hash + mask first n_rows.
 
         block_hash None -> full identity (mask off). per_nonce reflection needs
-        per-row vectors — not implemented in this revision (golden scope has it
+        per-row vectors — not implemented in this revision (the consensus
+        configuration has it
         off); fail loud rather than silently mis-derive.
         """
         if per_nonce:
             raise NotImplementedError(
                 "per_nonce_reflection needs per-row reflection buffers; "
-                "excluded from this revision (golden scope: off)")
+                "off in the consensus configuration")
         key = (block_hash, refl_nonce, n_rows)
         if key == self._rows_key:
             return
@@ -148,7 +149,7 @@ class PoCNativeState:
         n = len(nonces) * tokens_per_nonce
         base_key = (block_hash, tuple(nonces), tokens_per_nonce)
         if base_key != self._route_key:
-            # ``li`` is the GLOBAL decoder-layer index (phase-0 decision #4:
+            # ``li`` is the GLOBAL decoder-layer index (deliberately the
             # same numbering as the Householder seeds). For all-MoE stacks
             # (MiniMax) it equals the discovery order, so bits are unchanged;
             # for dense-prefixed stacks (DeepSeek family) it pins the seed to

@@ -4,7 +4,7 @@ mixing with a self-contained step loop on the worker.
 One chunk = ``len(nonces)`` sequences, each holding ``seq_len + max_tokens``
 KV tokens for the whole trajectory:
 
-    prefill (seq_len synthetic embeds, fresh buffer — decision #12)
+    prefill (seq_len synthetic embeds, fresh buffer — never a reused scratch)
       -> snap step 0
       -> for t in 1..max_tokens:
            embeds_t = f(prev_k)            (chained, on-device)
@@ -18,7 +18,7 @@ Migration rules honoured (NOTES.md):
   * the prefill chunk must fit the pre-sized MoE workspace: chunk ≤
     ``POC_DECODE_PREFILL_CHUNK`` (default 128 nonces × 256 tokens = 32768);
   * shared engine buffers are never resized here (v0.1.3 lesson);
-  * fresh prefill embeds always (decision #12 — golden parity), the legacy
+  * fresh prefill embeds always (parity with the 0.20 reference), the legacy
     KV-scratch quirk stays in the prefill-only path of tag v0.1.x.
 
 Consensus arithmetic lives in gpu_random/sphere/decode_chain (layer A,
@@ -54,7 +54,7 @@ logger = logging.getLogger(__name__)
 
 _MARGIN_TAU = float(os.environ.get("VLLM_POC_MARGIN_TAU", "0") or "0")
 # Compiled path is the default (0.20 bit reference); eager only as a debug
-# fallback behind the flag (migration rule: eager is not an execution mode).
+# fallback behind the flag (design rule: eager is not an execution mode).
 _SKIP_COMPILED = os.environ.get("POC_DECODE_SKIP_COMPILED", "0") == "1"
 # Per-step wall-clock breakdown (metadata/embeds/forward/snap) logged once per
 # chunk; costs one cuda sync per step — diagnostics only, keep off in prod.
@@ -281,7 +281,7 @@ def execute_poc_decode(
     if pp_group.world_size > 1:
         raise RuntimeError("decode-PoC: PP > 1 not supported in this revision")
 
-    # --- TP consensus gate (tech-debt #2): validate inputs on EVERY rank and
+    # --- TP consensus gate: validate inputs on EVERY rank and
     # agree via an all-reduce BEFORE the collective forward phase. A rank that
     # rejects (bad shapes / empty batch / lease too small) must not bail while
     # the others enter NCCL and hang forever. If any rank is unhealthy, all
@@ -325,7 +325,7 @@ def execute_poc_decode(
     if per_nonce_reflection:
         raise NotImplementedError(
             "per_nonce_reflection: per-row reflection buffers deferred "
-            "(golden scope: off)")
+            "(off in the consensus configuration)")
 
     # --- chain state (address-stable, capture-ready) ------------------------
     codebook = get_sphere_codebook().to(device=device)

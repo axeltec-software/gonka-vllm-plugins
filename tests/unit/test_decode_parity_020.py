@@ -1,19 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 """Bit-for-bit parity: ported decode math vs the 0.20 in-tree branch.
 
-Ladder step 1 of the migration (docs/05 §8): every consensus-critical function
+Ladder step 1 of the migration: every consensus-critical function
 ported from ``poc-v0.20-decode-poc-cg @ 5c1d09f55e92`` must produce IDENTICAL
 bits to the original source, executed side by side on CPU.
 
-The 0.20 sources are not a package — they are loaded straight from the
-migration bundle via ``DECODE020_PATH`` (defaults to the bundle location on
-the machine that runs the migration).  When the path is absent the module
-SKIPS: CI without the bundle stays green, the migration box runs the real
-comparison.
+The 0.20 sources are not a package — they are loaded from the directory
+named by ``DECODE020_PATH`` (no default). When the variable is unset or the
+path is absent the module SKIPS: CI without the reference sources stays
+green, a box that has them runs the real comparison.
 
 Also proves the two DOCUMENTED equivalences the port relies on:
   * ``generate_inputs``: 0.20 batched variant == plugin v0.1.x per-nonce loop;
-  * decode seed scheme (decision #1/#4): ``random_pick_indices`` now always
+  * decode seed scheme: ``random_pick_indices`` now always
     salts ``_decode{step}`` — asserted against the 0.20 body, and asserted
     DIFFERENT from the legacy v0.1.x seeding (guard against silent rollback).
 """
@@ -28,13 +27,12 @@ import torch
 
 DECODE020_PATH = os.environ.get(
     "DECODE020_PATH",
-    "/root/projects/kaitakuai/.work/instances/decode-poc-migration-025/"
-    "bundle/src/decode-poc-0.20",
+    "",
 )
 
 pytestmark = pytest.mark.skipif(
     not os.path.isdir(DECODE020_PATH),
-    reason="0.20 bundle sources not present (set DECODE020_PATH)",
+    reason="set DECODE020_PATH to the 0.20 reference sources to run parity",
 )
 
 

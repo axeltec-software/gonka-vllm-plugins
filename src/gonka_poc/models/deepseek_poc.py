@@ -6,7 +6,7 @@ construct OUR subclass, and the wrappers attach at the END of ``load_weights``
 
 One subclass covers the whole family — Kimi K-series checkpoints declare the
 DeepSeek architecture in their HF config, so they resolve to the same class.
-The grouped-router support (phase-0 decision #2: two-stage seeded forcing)
+The grouped-router support (two-stage seeded forcing)
 lives in gpu_random/native and keys off n_group/topk_group discovered at
 attach time, so nothing here is model-specific beyond the base class.
 """

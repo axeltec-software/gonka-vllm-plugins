@@ -47,8 +47,8 @@ class PoCParamsModel(BaseModel):
     seq_len: int
     k_dim: int = 12
     # Decode-PoC (the canonical scheme of this release). max_tokens == 0 keeps
-    # the prefill-only artifact of the DECODE seed scheme (decision #1);
-    # poc_decode := max_tokens > 0 (decision #7 — no server flag).
+    # the prefill-only artifact of the DECODE seed scheme; max_tokens > 0
+    # selects decode (a request property — there is no server-side flag).
     max_tokens: int = 0
     # Routing window: consensus value ships in the request from the Go node
     # reading the on-chain config; recorded in the artifact encoding
@@ -138,7 +138,7 @@ class PoCGenerateRequest(BaseModel):
     # Decode-PoC: reference trajectories for teacher forcing (0.20 wire shape:
     # {nonce: [k0..kN]}); alternatively taken from validation.artifacts'
     # k_points_steps. Emission of pre-snap slices: debug (all steps) or the
-    # leading va_steps window (decision #8 — request parameter).
+    # leading va_steps window (a request parameter).
     enforced_k_steps: Optional[Dict[int, List[int]]] = None
     debug: bool = False
     poc_vector_artifact_steps: int = 0
@@ -610,7 +610,7 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
         
         return {"status": "queued", "request_id": request_id, "queued_count": len(body.nonces)}
     
-    # Decode-PoC is the ONLY scheme of this release (decision #1; the prefill
+    # Decode-PoC is the ONLY scheme of this release (the prefill
     # scheme lives in the v0.1.x tags). max_tokens == 0 degenerates to a
     # prefill-only trajectory (one snap step) through the same decode loop.
     return await _generate_decode(request, body, engine_client, app_id)
@@ -622,7 +622,7 @@ async def _generate_decode(request: Request, body: PoCGenerateRequest,
 
     Chunk size: min(batch_size or AUTO, POC_DECODE_PREFILL_CHUNK) — the
     prefill of a chunk must fit the pre-sized MoE workspace (v0.1.3 lesson);
-    batch_size == 0 means AUTO (decision #5).
+    batch_size == 0 means AUTO.
     """
     from gonka_poc.poc.decode_runner import POC_DECODE_MAX_BATCH
     from .data import fraud_test
@@ -709,7 +709,7 @@ async def _generate_decode(request: Request, body: PoCGenerateRequest,
                 total, max_tokens + 1, elapsed, rate)
 
     encoding = wire_encoding(body.params.k_dim)
-    encoding["route_window"] = body.params.route_window   # decision #6
+    encoding["route_window"] = body.params.route_window   # echoed so the validator replays the same window
     encoding["seq_len"] = seq_len
     encoding["max_tokens"] = max_tokens
 

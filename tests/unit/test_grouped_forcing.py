@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Phase-0 decision #2: two-stage seeded forcing for grouped top-k routers.
+"""Two-stage seeded forcing for grouped top-k routers.
 
 CPU-only. Three layers of protection:
   * PROPERTY tests against a naive reimplementation of the DeepSeek-style

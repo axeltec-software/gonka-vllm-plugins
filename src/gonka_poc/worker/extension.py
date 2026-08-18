@@ -5,10 +5,10 @@ the compat shim).
 Activation:
     vllm serve <model> --worker-extension-cls gonka_poc.worker.PoCWorkerExtension
 
-How vLLM wires this in (v0.23.0, verified):
-    ``vllm/v1/worker/worker_base.py:261-287`` (WorkerWrapperBase.init_worker)
+How vLLM wires this in (verified on the 0.25.1 line):
+    ``vllm/v1/worker/worker_base.py:263-284`` (WorkerWrapperBase.init_worker)
     resolves the qualname, asserts no attribute collisions with the concrete
-    Worker, then does ``worker_class.__bases__ += (PoCWorkerExtension,)``.
+    Worker, then appends ``PoCWorkerExtension`` to ``worker_class.__bases__``.
     There is NO __init__ -- methods just become attributes on the live Worker.
 
 Inside any method on this class, ``self`` is the live GPU Worker. Available

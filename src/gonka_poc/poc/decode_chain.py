@@ -3,7 +3,7 @@ nonce, extracted from the 0.20 in-tree branch (mixed_decode.py) WITHOUT the
 engine orchestration around it.
 
 Everything here is a pure tensor function: no engine state, no host branches,
-address-stable — safe inside a captured CUDA graph (migration rule: eager is
+address-stable — safe inside a captured CUDA graph (design rule: eager is
 not an execution mode).
 
 Ported bit-for-bit; sources cited per function.
