@@ -236,45 +236,6 @@ def apply_householder(
     return x - 2 * dot * v
 
 
-def random_pick_indices(
-    block_hash: str,
-    public_key: str,
-    nonces: List[int],
-    dim: int,
-    k: int,
-    device: torch.device,
-    prev_point_ids: Optional[List[int]] = None,
-    step: int = 0,
-) -> torch.Tensor:
-    """Pick k dimensions per nonce deterministically (vectorized).
-
-    When prev_point_ids is provided the seed is mixed with the previous
-    sphere index so decode steps pick a different subset than prefill.
-    """
-    if k <= 0 or k > dim:
-        raise ValueError(f"k must be in [1, dim], got k={k}, dim={dim}")
-
-    batch_size = len(nonces)
-
-    seeds = []
-    for i, nonce in enumerate(nonces):
-        if prev_point_ids is None:
-            seeds.append(_seed_from_string(
-                f"{block_hash}_{public_key}_nonce_{nonce}_pick_{k}_decode{step}"
-            ))
-        else:
-            seeds.append(_seed_from_string(
-                f"{block_hash}_{public_key}_nonce_{nonce}_pick_{k}_decode{step}_k_{prev_point_ids[i]}"
-            ))
-
-    all_idx = torch.arange(dim, device=device, dtype=torch.int32).unsqueeze(0).expand(batch_size, -1)
-    seed_tensor = torch.tensor(seeds, dtype=torch.int64, device=device).unsqueeze(1)
-    scores = _batched_murmur3_32(all_idx, seed_tensor)
-
-    _, chosen = torch.topk(-scores, k=k, largest=True, sorted=False, dim=1)
-    return chosen.to(torch.int64)
-
-
 def apply_haar_rotation(
     block_hash: str,
     public_key: str,

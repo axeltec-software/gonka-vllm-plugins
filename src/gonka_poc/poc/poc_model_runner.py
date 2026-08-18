@@ -46,14 +46,6 @@ from vllm.logger import init_logger
 
 from gonka_poc._compat import current as _compat_current
 
-from .gpu_random import (
-    generate_inputs,
-    generate_inputs_concat_murmur,
-    derive_pseudo_input_ids,
-    random_pick_indices,
-    apply_haar_rotation,
-)
-
 logger = init_logger(__name__)
 
 DEFAULT_K_DIM = 12

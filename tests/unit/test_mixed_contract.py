@@ -19,7 +19,8 @@ def test_core_never_imports_mixed():
         if "mixed" in p.parts:
             continue
         text = p.read_text(encoding="utf-8")
-        if "gonka_poc.mixed" in text or "from .mixed" in text:
+        import re
+        if re.search(r"gonka_poc\.mixed|from\s+\.\s*mixed|from\s+gonka_poc\s+import[^\n]*\bmixed\b", text):
             offenders.append(str(p.relative_to(SRC)))
     assert not offenders, f"core imports mixed (one-way rule): {offenders}"
 
@@ -47,9 +48,36 @@ def test_hook_installs_and_fires(monkeypatch):
 
 
 def test_hook_never_raises():
+    """Скелет observe-only обязан глотать СВОИ ошибки (не тавтология: подаём
+    scheduler_output, который ломает внутреннюю арифметику)."""
     from gonka_poc.mixed import pre_forward
-    pre_forward.poc_pre_forward(None, object(), None, None, None, None)
-    assert pre_forward.stats()["errors"] >= 0  # счётчик жив, исключения нет
+    before = pre_forward.stats()["errors"]
+    bad = types.SimpleNamespace(total_num_scheduled_tokens="abc",
+                                num_scheduled_tokens=None)
+    pre_forward.poc_pre_forward(None, bad, None, None, None, None)
+    s = pre_forward.stats()
+    assert s["errors"] == before + 1  # ошибка учтена, наружу не вышла
+
+
+def test_hook_signature_matches_residual_seam():
+    """Пин сигнатуры к резидуальному колл-сайту (kaitakuai/vllm@13e6bacd):
+    _hook(self, scheduler_output, input_ids, positions, inputs_embeds,
+    attn_metadata). Дрейф арности = TypeError на КАЖДОМ шаге движка."""
+    import inspect
+    from gonka_poc.mixed import pre_forward
+    params = list(inspect.signature(pre_forward.poc_pre_forward).parameters)
+    assert params == ["runner", "scheduler_output", "input_ids", "positions",
+                      "inputs_embeds", "attn_metadata"]
+
+
+def test_hook_records_ubatched_shape():
+    from gonka_poc.mixed import pre_forward
+    sched = types.SimpleNamespace(total_num_scheduled_tokens=8,
+                                  num_scheduled_tokens={"r": 8})
+    pre_forward.poc_pre_forward(None, sched, None, None, None, [{}, {}])
+    assert pre_forward.stats()["attn_is_ubatched"] is True
+    pre_forward.poc_pre_forward(None, sched, None, None, None, {})
+    assert pre_forward.stats()["attn_is_ubatched"] is False
 
 
 def test_install_refuses_without_residual_seam(monkeypatch):

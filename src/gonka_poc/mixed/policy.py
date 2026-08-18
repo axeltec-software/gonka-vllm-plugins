@@ -63,3 +63,12 @@ def resolve_poc_max_batch_size(configured: int, max_num_seqs: int) -> int:
     instead of being pinned to a fixed constant that throttles it on bigger machines.
     Any explicit >0 value is honored verbatim. Pure (unit-testable)."""
     return max_num_seqs if configured == 0 else configured
+
+
+def poc_alloc_footprint(poc_params, num_new_tokens: int) -> int:
+    """Dynamic-KV blocks to allocate: the pure path runs the whole decode loop in
+    one step so it allocates seq_len+max_tokens upfront; the mixed path allocates
+    one step's tokens. Pure (unit-testable)."""
+    if poc_is_pure_path(poc_params):
+        return poc_params.seq_len + poc_params.max_tokens
+    return num_new_tokens

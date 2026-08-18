@@ -22,6 +22,7 @@ import os
 # Smoke evidence, drained via PoCWorkerExtension.mixed_hook_stats RPC.
 _STATS = {
     "calls": 0,
+    "attn_is_ubatched": False,
     "last_num_tokens": -1,
     "last_num_reqs": -1,
     "has_attn_metadata": False,
@@ -31,8 +32,16 @@ _STATS = {
 
 def poc_pre_forward(runner, scheduler_output, input_ids, positions,
                     inputs_embeds, attn_metadata):
-    """Skeleton hook: observe-only (cheap int writes; no GPU work, no sync)."""
+    """Skeleton hook: observe-only (cheap int writes; no GPU work, no sync).
+
+    Residual-seam contract (see residual-pre-forward-hooks.md): an exception
+    escaping a REAL (non-skeleton) hook is fail-fast BY DESIGN — a silently
+    lost PoC hook is worse than a loud step failure. The skeleton swallows
+    its own errors only because it is observe-only. attn_metadata is
+    polymorphic: dict per attn-group, or a LIST of dicts under ubatching —
+    real hooks must handle both or refuse loudly."""
     try:
+        _STATS["attn_is_ubatched"] = isinstance(attn_metadata, list)
         _STATS["calls"] += 1
         if scheduler_output is not None:
             _STATS["last_num_tokens"] = int(
