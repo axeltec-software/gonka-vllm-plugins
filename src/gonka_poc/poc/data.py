@@ -1,7 +1,7 @@
 """PoC data types and helpers for artifact-based validation."""
 import base64
 from dataclasses import dataclass
-from typing import Tuple
+from typing import List, Tuple, Optional
 
 import numpy as np
 from scipy.stats import binomtest
@@ -15,9 +15,48 @@ DEFAULT_FRAUD_THRESHOLD = 0.01
 
 @dataclass
 class Artifact:
-    """Single nonce artifact with base64-encoded vector."""
+    """Single nonce artifact. Prefill PoC carries vector_b64; decode PoC carries the
+    sphere_k trajectory (k_points_steps) and leaves vector_b64 empty."""
     nonce: int
     vector_b64: str
+    k_points_steps: Optional[List[int]] = None
+    # windowed pre-snap slices (poc_vector_artifacts) or full debug trajectory
+    sph_values_steps: Optional[List[str]] = None
+
+
+@dataclass
+class Encoding:
+    """Metadata for vector encoding."""
+    dtype: str = "f16"
+    k_dim: int = 12
+    endian: str = "le"
+
+
+@dataclass
+class ArtifactBatch:
+    """Batch of artifacts for callback payloads."""
+    public_key: str
+    block_hash: str
+    block_height: int
+    node_id: int
+    artifacts: List[Artifact]
+    encoding: Encoding
+
+
+@dataclass
+class ValidationResult:
+    """Result of artifact validation."""
+    public_key: str
+    block_hash: str
+    block_height: int
+    node_id: int
+    nonces: List[int]
+    n_total: int
+    n_mismatch: int
+    mismatch_nonces: List[int]
+    fraud_threshold: float = DEFAULT_FRAUD_THRESHOLD
+    p_value: Optional[float] = None
+    fraud_detected: Optional[bool] = None
 
 
 def encode_vector(vector: np.ndarray) -> str:
@@ -33,9 +72,17 @@ def decode_vector(b64: str) -> np.ndarray:
     return f16.astype(np.float32)
 
 
-def wire_encoding(k_dim: int) -> dict:
-    """Wire-protocol encoding descriptor for artifact vectors."""
-    return {"dtype": "f16", "k_dim": k_dim, "endian": "le"}
+def is_mismatch(
+    computed_vector: np.ndarray,
+    received_b64: str,
+    dist_threshold: float = DEFAULT_DIST_THRESHOLD,
+) -> bool:
+    """Check if vectors differ beyond threshold."""
+    received = decode_vector(received_b64)
+    if not np.all(np.isfinite(received)):
+        return True
+    distance = float(np.linalg.norm(computed_vector - received))
+    return distance > dist_threshold
 
 
 def fraud_test(
@@ -68,3 +115,30 @@ def fraud_test(
     p_value = float(result.pvalue)
     fraud_detected = p_value < fraud_threshold
     return p_value, fraud_detected
+
+
+def compare_artifacts(
+    computed_vectors: List[np.ndarray],
+    received_artifacts: List[Artifact],
+    dist_threshold: float = DEFAULT_DIST_THRESHOLD,
+) -> Tuple[int, List[int]]:
+    """
+    Compare computed vectors against received artifacts.
+    
+    Args:
+        computed_vectors: List of computed FP32 vectors
+        received_artifacts: List of received Artifact objects
+        dist_threshold: L2 distance threshold for mismatch
+    
+    Returns:
+        (n_mismatch, mismatch_nonces)
+    """
+    n_mismatch = 0
+    mismatch_nonces = []
+    
+    for vec, artifact in zip(computed_vectors, received_artifacts):
+        if is_mismatch(vec, artifact.vector_b64, dist_threshold):
+            n_mismatch += 1
+            mismatch_nonces.append(artifact.nonce)
+    
+    return n_mismatch, mismatch_nonces

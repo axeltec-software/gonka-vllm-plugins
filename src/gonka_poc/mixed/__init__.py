@@ -13,3 +13,6 @@ tests/unit/test_mixed_contract.py). Engine coupling is exactly two seams:
 
 Everything else rides the same public points the core already uses.
 """
+
+from gonka_poc.mixed.admission import PoCAdmission  # noqa: E402
+from gonka_poc.mixed.bridge import PoCRunnerBridge  # noqa: E402

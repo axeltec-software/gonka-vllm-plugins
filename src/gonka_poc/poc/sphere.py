@@ -10,9 +10,9 @@ from typing import Optional
 
 import torch
 
-import logging
+from vllm.logger import init_logger
 
-logger = logging.getLogger(__name__)
+logger = init_logger(__name__)
 
 # SPHERE_DIM: dimension of the hidden-state slice projected onto the sphere.
 # SPHERE_POINTS: number of equidistant codebook points on that sphere.

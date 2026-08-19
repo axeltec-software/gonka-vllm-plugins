@@ -1,14 +1,32 @@
-"""PoC sub-package.
+# PoC runs through the engine scheduler via generate(poc_params=...).
+# No collective_rpc monkeypatch.
+from .config import PoCConfig, PoCState
+from .data import (
+    Artifact,
+    Encoding,
+    ArtifactBatch,
+    ValidationResult,
+    encode_vector,
+    decode_vector,
+    is_mismatch,
+    fraud_test,
+    compare_artifacts,
+)
+from .routes import router as poc_router
+from .poc_params import PoCParams
 
-Intentionally inert: importing ``gonka_poc.poc`` MUST NOT trigger any
-side effects (no engine patching, no router registration, no model
-imports). Each consumer pulls what it needs from the explicit module
-path, e.g.::
-
-    from gonka_poc.poc.routes import router as poc_router
-    from gonka_poc.poc.data import encode_vector, decode_vector
-    from gonka_poc.poc.decode_runner import execute_poc_decode
-
-PoC dispatch is via ``collective_rpc("execute_poc_decode", kwargs=...)``
-on :class:`gonka_poc.worker.PoCWorkerExtension`.
-"""
+__all__ = [
+    "PoCConfig",
+    "PoCState",
+    "PoCParams",
+    "Artifact",
+    "Encoding",
+    "ArtifactBatch",
+    "ValidationResult",
+    "encode_vector",
+    "decode_vector",
+    "is_mismatch",
+    "fraud_test",
+    "compare_artifacts",
+    "poc_router",
+]

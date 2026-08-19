@@ -667,66 +667,6 @@ def test_openai_serving_chat_export() -> None:
         "OpenAIServingChat.create_chat_completion missing -- "
         "the OpenAI chat serving surface restructured."
     )
-
-
-# ---------------------------------------------------------------------------- #
-# _compat dispatcher contract (regression for the lru_cache function-binding bug)
-# ---------------------------------------------------------------------------- #
-
-def test_compat_current_returns_module() -> None:
-    """``from gonka_poc._compat import current`` MUST be a callable resolver
-    that returns the dispatched compat module.
-
-    Regression: a previous revision exposed ``current`` as the
-    ``lru_cache``-wrapped function itself. ``from gonka_poc._compat import
-    current as compat`` then bound the function, so every subsequent
-    ``compat.build_common_attention_metadata(...)`` raised ``AttributeError``
-    (functions do not carry arbitrary attributes) and the first PoC forward
-    crashed in production. The contract pinned here:
-
-        from gonka_poc._compat import current
-        mod = current()          # callable, returns a module
-        mod.build_common_attention_metadata(...)  # symbols live on the module
-
-    is the only shape that survives both ``from ... import current`` (which
-    bypasses PEP 562 ``__getattr__``) and attribute-style ``_compat.current``.
-    """
-    pytest.importorskip("vllm")
-    from gonka_poc._compat import current
-
-    assert callable(current), (
-        "gonka_poc._compat.current must be callable -- "
-        "the lru_cache function-binding regression has returned. "
-        "Consumers do ``from gonka_poc._compat import current`` and then "
-        "``compat = current(); compat.<symbol>(...)``."
-    )
-
-    import types
-
-    mod = current()
-    assert isinstance(mod, types.ModuleType), (
-        f"current() must return a module, got {type(mod)!r}. "
-        "Check gonka_poc._compat.__init__._current_impl resolver."
-    )
-
-    for symbol in (
-        "build_common_attention_metadata",
-        "build_attn_metadata_per_group",
-        "get_kv_cache_pool",
-        "abort_all_requests",
-        "install_engine_core_poc_methods",
-        "borrow_poc_blocks",
-        "return_poc_blocks",
-    ):
-        attr = getattr(mod, symbol, None)
-        assert callable(attr), (
-            f"compat module missing callable {symbol!r}; "
-            f"present attrs = {sorted(a for a in dir(mod) if not a.startswith('_'))!r}. "
-            f"Either gonka_poc._compat.v0_25 dropped the export or _DISPATCH "
-            f"is pointing at the wrong module."
-        )
-
-
 # ---------------------------------------------------------------------------- #
 # KV block borrowing surface (PoC validation without aborting inference)
 # ---------------------------------------------------------------------------- #

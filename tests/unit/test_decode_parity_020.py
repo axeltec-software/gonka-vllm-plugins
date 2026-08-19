@@ -191,24 +191,24 @@ def test_pick_gpu_parity(g020, gnew):
 
 
 # ------------------------------------------------------------- routing
-def test_routing_parity_full_and_windowed(g020, gnew):
+def test_routing_diverges_from_020_by_design(g020, gnew):
+    """The expert pick CHANGED from the 0.20 formula (Fisher-Yates /
+    windowed) to the contiguous seeded run — an intentional consensus
+    change (the selection-override design). This pin asserts the
+    DIVERGENCE, so an accidental revert to the old formula is caught as
+    loudly as an accidental change was before. Seed derivation
+    (route_base_seed + step fold) is still shared and covered above."""
     n_experts, top_k = 256, 8
-    for window in (16, 64, 256):
-        g020.set_route_window(window)
-        gnew.set_route_window(window)
-        for step in (0, 1, 200):
-            for layer in (0, 30):
-                a = g020.seeded_experts(BH, 7, step, layer, n_experts, top_k, DEV)
-                b = gnew.seeded_experts(BH, 7, step, layer, n_experts, top_k, DEV)
-                assert torch.equal(a, b), f"w={window} step={step} layer={layer}"
-    # window >= n_experts must be the legacy full scatter (docs/04 §3)
-    g020.set_route_window(256); gnew.set_route_window(256)
     base = torch.tensor([gnew._seed_from_string(gnew.route_base_seed(BH, 7, 0))],
                         dtype=torch.int64)
     steps = torch.tensor([3], dtype=torch.int64)
-    a = g020.expert_logits_from_base(base, steps, n_experts, top_k, DEV)
     b = gnew.expert_logits_from_base(base, steps, n_experts, top_k, DEV)
-    assert torch.equal(a, b)
+    ids = torch.topk(b[0], top_k).indices.sort().values.tolist()
+    span = (max(ids) - min(ids)) % n_experts
+    assert span == top_k - 1 or (n_experts - 1 - span) < top_k  # contiguous run
+    g020.set_route_window(256)
+    a = g020.expert_logits_from_base(base, steps, n_experts, top_k, DEV)
+    assert not torch.equal(a, b)
 
 
 def test_householder_and_haar_parity(g020, gnew):
@@ -246,17 +246,17 @@ def test_snap_parity(s020, snew):
 
 
 # -------------------------------------------------------- chain rules
-def test_chain_rules_against_020_formula():
-    from gonka_poc.poc.decode_chain import count_mismatch, next_prev_k, keep_q_step
-    k = torch.tensor([3, 3, -1, 7, 7], dtype=torch.int64)
-    ref = torch.tensor([3, 4, 4, 7, 2], dtype=torch.int64)
-    margin = torch.tensor([0.5, 0.5, 0.5, 0.01, 0.001])
-    # 0.20 formula: (k != ref) & (k >= 0) & (margin >= tau)
-    for tau in (0.0, 0.05):
-        expect = ((k != ref) & (k >= 0) & (margin >= tau)).to(torch.int64)
-        assert torch.equal(count_mismatch(k, ref, margin, tau), expect)
-    assert torch.equal(next_prev_k(k, ref), ref)          # teacher forcing
-    assert torch.equal(next_prev_k(k, None), k)           # generation
-    assert keep_q_step(3, True, False, 0)
-    assert keep_q_step(64, False, True, 64)
-    assert not keep_q_step(65, False, True, 64)
+def test_chain_rules_match_020_semantics():
+    """Pin the mixed-path chain rules to the 0.20 behavior: validation is
+    ALIGNED (mismatch counted per step, next step seeded from the reference —
+    no cascade), generation seeds from own k."""
+    from gonka_poc.mixed.runtime import aligned_step, keep_q_step
+    # validating: mismatch iff own != ref; prev_k for the next step is ref
+    assert aligned_step(3, 3) == (0, 3)
+    assert aligned_step(3, 4) == (1, 4)
+    # generating (no reference): never a mismatch, chain from own k
+    assert aligned_step(7, None) == (0, 7)
+    # q-vector retention: debug or validation keeps the step
+    assert keep_q_step(3, True, False)
+    assert keep_q_step(64, False, True)
+    assert not keep_q_step(65, False, False)

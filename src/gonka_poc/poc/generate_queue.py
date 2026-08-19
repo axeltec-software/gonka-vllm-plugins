@@ -1,21 +1,107 @@
 """PoC generate queue with bounded nonce cap and result store."""
 import asyncio
+import os
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 from vllm.logger import init_logger
-from .config import (
-    GENERATION_ACTIVE_POLL_SEC,
-    POC_GENERATE_CHUNK_TIMEOUT_SEC,
-    POC_GENERATE_RESULT_TTL_SEC,
-    POC_MAX_QUEUED_NONCES,
-)
-from .reservation import poc_reservation
+from .validation import run_validation
 from .callbacks import get_callback_queue, clear_callback_queue
-from .data import DEFAULT_P_MISMATCH, DEFAULT_FRAUD_THRESHOLD, fraud_test, wire_encoding
+from .data import DEFAULT_DIST_THRESHOLD, DEFAULT_P_MISMATCH, DEFAULT_FRAUD_THRESHOLD
+from .poc_params import PoCParams
 
 logger = init_logger(__name__)
+
+
+async def compute_nonce_artifacts(
+    engine_client,
+    nonces: List[int],
+    block_hash: str,
+    public_key: str,
+    block_height: int,
+    seq_len: int,
+    k_dim: int,
+    poc_decode: bool = False,
+    max_tokens: int = 0,
+    enforced_k_steps: Optional[Dict[int, List[int]]] = None,
+    debug: bool = False,
+    per_nonce_reflection: bool = False,
+) -> List[dict]:
+    """Compute PoC artifacts for a set of nonces via the scheduler.
+
+    One PoC request per nonce is submitted through
+    ``engine_client.generate(poc_params=...)`` and gathered concurrently. The
+    scheduler runs pure-PoC batches (KV-bound decode on paged blocks, full
+    sphere_k trajectory) or interleaves prefill-only PoC with live chat —
+    PoC and chat co-exist with no chat freeze.
+
+    This is the single source of truth for PoC artifact computation; both the
+    /generate endpoint and the queue worker call it.
+    """
+    async def compute_one(nonce: int) -> Optional[dict]:
+        inf_steps = (enforced_k_steps.get(nonce)
+                     if enforced_k_steps else None)
+        poc_params = PoCParams(
+            block_hash=block_hash,
+            public_key=public_key,
+            block_height=block_height,
+            nonce=nonce,
+            seq_len=seq_len,
+            k_dim=k_dim,
+            poc_decode=poc_decode,
+            max_tokens=max_tokens,
+            enforced_k_steps=inf_steps,
+            debug=debug,
+            per_nonce_reflection=per_nonce_reflection,
+        )
+        request_id = f"poc-{uuid.uuid4()}"
+        # PoC emits its artifact ONCE (emit-once): a single finished output
+        # carrying the full trajectory (decode) or vector (prefill).
+        try:
+            async for output in engine_client.generate(
+                prompt=None,
+                sampling_params=None,
+                poc_params=poc_params,
+                request_id=request_id,
+                priority=10,
+            ):
+                if not output.finished:
+                    continue
+                poc_out = output.poc_output
+                if not poc_out:  # None or empty dict (PoC ran but no artifact)
+                    return None
+                get = poc_out.get if isinstance(poc_out, dict) else (
+                    lambda k, d=None: getattr(poc_out, k, d))
+                # sph_indices_steps is debug-only; sph_values_steps is emitted
+                # under debug (full) or poc_vector_artifacts (windowed slice).
+                artifact = {
+                    "nonce": get("nonce", nonce),
+                    "vector_b64": get("vector_b64", ""),
+                    "k_points_steps": get("k_points_steps", []),
+                    "n_sphere_mismatches": get("n_sphere_mismatches", -1),
+                    "n_nan_steps": get("n_nan_steps", 0),
+                }
+                if debug:
+                    artifact["sph_indices_steps"] = get("sph_indices_steps", [])
+                    artifact["sph_values_steps"] = get("sph_values_steps", [])
+                else:
+                    sph_vals = get("sph_values_steps", [])
+                    if sph_vals:
+                        artifact["sph_values_steps"] = sph_vals
+                return artifact
+        except Exception as e:
+            logger.error("Error computing nonce %s: %r", nonce, e, exc_info=True)
+        return None
+
+    results = await asyncio.gather(*[compute_one(n) for n in nonces])
+    return [r for r in results if r is not None]
+
+POC_GENERATE_CHUNK_TIMEOUT_SEC = float(os.environ.get("POC_GENERATE_CHUNK_TIMEOUT_SEC", "60"))
+POC_CHAT_BUSY_BACKOFF_SEC = 0.05
+POC_GENERATE_RESULT_TTL_SEC = float(os.environ.get("POC_GENERATE_RESULT_TTL_SEC", "300"))
+POC_MAX_QUEUED_NONCES = int(os.environ.get("POC_MAX_QUEUED_NONCES", "100000"))
 
 
 @dataclass
@@ -33,9 +119,19 @@ class GenerateJob:
     seq_len: int
     k_dim: int
     batch_size: int
+    route_window: int = 16  # MoE seeded-routing window used; recorded in artifact encoding
+    poc_stronger_rng: bool = False
+    poc_decode: bool = False
     max_tokens: int = 0
-    route_window: int = 256
     enforced_k_steps: Optional[Dict[int, List[int]]] = None
+    debug: bool = False
+    per_nonce_reflection: bool = False
+    validation_artifacts: Optional[Dict[int, str]] = None
+    # nonce -> reference sph_values_steps (debug or poc_vector_artifacts refs):
+    # enables the continuous vector_score on the queued path, same as the
+    # inline wait=true path.
+    ref_vectors: Optional[Dict[int, List[str]]] = None
+    stat_test_dist_threshold: float = DEFAULT_DIST_THRESHOLD
     stat_test_p_mismatch: float = DEFAULT_P_MISMATCH
     stat_test_fraud_threshold: float = DEFAULT_FRAUD_THRESHOLD
     callback_url: Optional[str] = None
@@ -94,15 +190,17 @@ class GenerateQueue:
         return self._results.get(request_id)
     
     async def clear_all(self):
-        """Clear queue and results; also signals the worker's stop_event
-        (it calls self._stop_event.set())."""
+        """Clear queue and results."""
         async with self._lock:
             while not self._queue.empty():
                 try:
-                    self._queue.get_nowait()
+                    job = self._queue.get_nowait()
+                    if job.request_id in self._results:
+                        self._results[job.request_id].status = "cancelled"
+                        self._results[job.request_id].completed_at = time.time()
                 except asyncio.QueueEmpty:
                     break
-
+            
             self._queued_nonces = 0
             self._results.clear()
             self._stop_event.set()
@@ -167,7 +265,7 @@ class GenerateQueue:
                         while self._is_generation_active(job.app_id):
                             if self._stop_event.is_set():
                                 break
-                            await asyncio.sleep(GENERATION_ACTIVE_POLL_SEC)
+                            await asyncio.sleep(0.1)
                     
                     if self._stop_event.is_set():
                         break
@@ -205,106 +303,83 @@ class GenerateQueue:
         logger.info("Generate queue worker stopped")
     
     async def _process_job(self, job: GenerateJob) -> Dict[str, Any]:
-        """Process a single generate job (decode-PoC chunks)."""
-        from .decode_runner import POC_DECODE_MAX_BATCH
-        chunk_size = min(job.batch_size or POC_DECODE_MAX_BATCH,
-                         POC_DECODE_MAX_BATCH)
+        """Process a single generate job."""
         total_nonces = len(job.nonces)
-        n_chunks = (total_nonces + chunk_size - 1) // chunk_size
+        # batch_size 0 = no client-side chunking: submit every nonce at once and let the
+        # ENGINE batch them (capped per step by poc_max_batch_size, which auto-scales to
+        # max_num_seqs). Chunking here awaits each chunk SEQUENTIALLY, pinning in-flight
+        # nonces to the chunk size no matter what the engine can serve.
+        step = job.batch_size or total_nonces
+        n_chunks = (total_nonces + step - 1) // step
         logger.info(f"PoC queue job {job.request_id[:8]}: {total_nonces} nonces, batch_size={job.batch_size}, chunks={n_chunks}")
-        
+
         start_time = time.time()
         computed_artifacts = []
 
-        # One lease per job, reused across chunks; lease=None ⇒ inference
-        # already aborted, legacy in-place layout — see poc_reservation.
-        # The reservation lock also arbitrates with concurrent wait=True requests.
-        mismatch_total = 0
-        steps_total = 0
-        validating = job.enforced_k_steps is not None
-        n_eq = max(1, -(-total_nonces // chunk_size))
-        base, rem = divmod(total_nonces, n_eq)
-        bounds = []
-        off = 0
-        for ci in range(n_eq):
-            size = base + (1 if ci < rem else 0)
-            bounds.append((off, off + size))
-            off += size
-        async with poc_reservation(
-            job.engine_client, chunk_size, job.seq_len + job.max_tokens,
-        ) as lease:
-            for chunk_idx, (lo, hi) in enumerate(bounds):
-                chunk = job.nonces[lo:hi]
+        for i in range(0, total_nonces, step):
+            chunk = job.nonces[i:i + step]
+            chunk_idx = i // step
 
-                while True:
-                    if self._stop_event.is_set():
-                        raise RuntimeError("Job cancelled")
+            if self._stop_event.is_set():
+                raise RuntimeError("Job cancelled")
 
-                    if self._is_generation_active and self._is_generation_active(job.app_id):
-                        await asyncio.sleep(GENERATION_ACTIVE_POLL_SEC)
-                        continue
+            chunk_inference_steps = None
+            if job.enforced_k_steps:
+                chunk_inference_steps = {
+                    n: job.enforced_k_steps[n]
+                    for n in chunk if n in job.enforced_k_steps
+                }
 
-                    try:
-                        # Lazy import: routes.py imports GenerateJob/queue
-                        # from this module.
-                        from .routes import _execute_poc_decode_rpc
-                        result = await asyncio.wait_for(
-                            _execute_poc_decode_rpc(
-                                job.engine_client,
-                                nonces=chunk,
-                                block_hash=job.block_hash,
-                                public_key=job.public_key,
-                                seq_len=job.seq_len,
-                                max_tokens=job.max_tokens,
-                                route_window=job.route_window,
-                                enforced_k_steps=(
-                                    {n: job.enforced_k_steps[n] for n in chunk}
-                                    if validating else None),
-                                lease=lease,
-                            ),
-                            timeout=POC_GENERATE_CHUNK_TIMEOUT_SEC
-                        )
-                    except asyncio.CancelledError:
-                        logger.info(f"PoC queue job {job.request_id[:8]}: cancelled during RPC")
-                        raise RuntimeError("Job cancelled")
-                    except asyncio.TimeoutError:
-                        raise RuntimeError(f"Timeout waiting for engine RPC: chunk {chunk_idx}")
+            try:
+                artifacts = await compute_nonce_artifacts(
+                    job.engine_client, chunk,
+                    job.block_hash, job.public_key, job.block_height,
+                    job.seq_len, job.k_dim,
+                    poc_decode=job.poc_decode,
+                    max_tokens=job.max_tokens,
+                    enforced_k_steps=chunk_inference_steps,
+                    debug=job.debug,
+                    per_nonce_reflection=job.per_nonce_reflection,
+                )
+            except asyncio.CancelledError:
+                logger.info(f"PoC queue job {job.request_id[:8]}: cancelled")
+                raise RuntimeError("Job cancelled")
 
-                    computed_artifacts.extend(result.get("artifacts", []))
-                    steps_total += int(result.get("steps_total") or 0)
-                    if validating:
-                        mismatch_total += int(result.get("mismatch_total") or 0)
-                    logger.debug(f"PoC queue job {job.request_id[:8]}: chunk {chunk_idx+1}/{n_chunks} done ({len(chunk)} nonces)")
-                    break
-        
+            computed_artifacts.extend(artifacts)
+            logger.debug(f"PoC queue job {job.request_id[:8]}: chunk {chunk_idx+1}/{n_chunks} done ({len(chunk)} nonces)")
+
         elapsed = time.time() - start_time
         rate = total_nonces / elapsed if elapsed > 0 else 0
         logger.info(f"PoC queue job {job.request_id[:8]} completed: {total_nonces} nonces in {elapsed:.2f}s ({rate:.0f}/s)")
         
-        encoding = wire_encoding(job.k_dim)
-        encoding["route_window"] = job.route_window
-        encoding["seq_len"] = job.seq_len
-        encoding["max_tokens"] = job.max_tokens
-        if not validating:
+        if job.validation_artifacts is None:
             return {
                 "status": "completed",
                 "request_id": job.request_id,
                 "artifacts": computed_artifacts,
-                "encoding": encoding,
+                "encoding": {"dtype": "f16", "k_dim": job.k_dim, "endian": "le",
+                             "route_window": job.route_window},
             }
-
-        p_value, fraud = fraud_test(
-            n_mismatch=mismatch_total, n_total=steps_total,
+        
+        validation_result = run_validation(
+            computed_artifacts=computed_artifacts,
+            validation_map=job.validation_artifacts,
+            n_total=len(job.nonces),
+            dist_threshold=job.stat_test_dist_threshold,
             p_mismatch=job.stat_test_p_mismatch,
-            fraud_threshold=job.stat_test_fraud_threshold)
+            fraud_threshold=job.stat_test_fraud_threshold,
+            k_dim=job.k_dim,
+            use_trajectory=job.max_tokens > 0,
+            ref_vectors=job.ref_vectors,
+        )
+        
         return {
             "status": "completed",
             "request_id": job.request_id,
-            "artifacts": computed_artifacts,
-            "encoding": encoding,
-            "n_mismatch": mismatch_total, "n_total": steps_total,
-            "mismatch_rate": (mismatch_total / steps_total) if steps_total else 0.0,
-            "p_value": p_value, "fraud_detected": fraud,
+            **validation_result,
+            # parity with the inline wait=true path (routes.py): debug requests
+            # get the validator-side artifacts (sph_values_steps) back too.
+            "artifacts": computed_artifacts if job.debug else [],
         }
     
     def _enqueue_callback(self, job: GenerateJob, result: Dict[str, Any]):
@@ -336,6 +411,9 @@ class GenerateQueue:
                 "mismatch_nonces": result.get("mismatch_nonces", []),
                 "p_value": result.get("p_value", 1.0),
                 "fraud_detected": result.get("fraud_detected", False),
+                # continuous vector-channel evidence (present when the reference
+                # artifacts carried sph_values_steps); None otherwise.
+                "vector_score": result.get("vector_score"),
             }
             self._callback_queue.enqueue(job.callback_url, "validated", payload)
 

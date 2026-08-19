@@ -59,24 +59,6 @@ def register() -> None:
     if _registered:
         return
 
-    # PoC-wrapped model classes: registered FIRST so the engine compiles the
-    # wrapped module (transforms inside the compiled graph — 0.20 bit path).
-    try:
-        from vllm import ModelRegistry
-        ModelRegistry.register_model(
-            "MiniMaxM2ForCausalLM",
-            "gonka_poc.models.minimax_m2_poc:MiniMaxM2ForCausalLMPoC")
-        logger.info("gonka_poc: MiniMaxM2ForCausalLM overridden with PoC-wrapped class")
-        # DeepSeek family (covers Kimi K-series — same declared architecture).
-        # Subclasses are built dynamically against whatever base classes this
-        # vLLM build ships, so register by class object, not qualname.
-        from gonka_poc.models.deepseek_poc import build_poc_subclasses
-        for arch, sub in build_poc_subclasses():
-            ModelRegistry.register_model(arch, sub)
-            logger.info("gonka_poc: %s overridden with PoC-wrapped class", arch)
-    except Exception:  # pragma: no cover — non-vllm import contexts
-        logger.exception("gonka_poc: model registry override failed")
-
     # Expose a process-local flag so the gate-presence check in
     # ``gonka_poc.entrypoint.gating.PoCGatingMiddleware`` can detect "plugin
     # loaded but no gate attached" (operator likely ran plain ``vllm serve``
@@ -94,17 +76,6 @@ def register() -> None:
         logger.exception(
             "gonka_poc.plugin.register: build_app warning wrapper install failed"
         )
-
-    try:
-        from gonka_poc._compat import current as _compat_current
-
-        _compat_current().install_engine_core_poc_methods()
-    except Exception as exc:
-        # Unsupported vllm minor / import quirk: validation degrades to the
-        # legacy abort-based path, never a crash at plugin load.
-        logger.debug(
-            "gonka_poc.plugin.register: EngineCore borrow install skipped: %s",
-            exc)
 
     _registered = True
 
