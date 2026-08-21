@@ -16,6 +16,22 @@ import json
 import os
 from collections import defaultdict
 
+def _rate(res):
+    """Mismatch rate as a FRACTION from either schema: results.rate
+    (fraction, our collect.py) or results.rate_pct (percent, campaign
+    bundles)."""
+    if res.get("rate") is not None:
+        return float(res["rate"])
+    if res.get("rate_pct") is not None:
+        return float(res["rate_pct"]) / 100.0
+    return 0.0
+
+
+def _has_rate(res):
+    return res.get("rate") is not None or res.get("rate_pct") is not None
+
+
+
 
 def _load(paths):
     """Accepts files, globs, OR directories (recursed for *.json). So it works whether
@@ -172,7 +188,7 @@ def _calibrated_thresholds(vals):
         vbe, pbe = _backend(m.get("attention_backend")), _backend(m.get("prover_profile"))
         same_be = (vbe == pbe and vbe != "?")
         bucket = "hs" if (v == p and same_be) else ("hx" if v == p else "fr")
-        g[v][bucket].append(res.get("rate", 0.0))
+        g[v][bucket].append(_rate(res))
     out = {}
     for v, b in g.items():
         hs = max(b["hs"]) if b["hs"] else None
@@ -188,7 +204,7 @@ def _calibrated_thresholds(vals):
 
 def separation_section(recs):
     vals = [(r["meta"], r["results"]) for r in recs
-            if r.get("meta", {}).get("role") == "validate" and "rate" in r.get("results", {})]
+            if r.get("meta", {}).get("role") == "validate" and _has_rate(r.get("results", {}))]
     if not vals:
         return "<p class=na>no separation runs</p>", None
     # Trajectory is config-sensitive in degrees (same config < graph mode < attention
@@ -199,10 +215,10 @@ def separation_section(recs):
     any_cross = False
     out = ["<table><tr><th>hardware (val ⇐ prover)</th><th>config (val ⇐ prover)</th>"
            "<th>model (val ⇐ prover)</th><th>kind</th><th>rate</th><th>verdict</th><th></th></tr>"]
-    for m, res in sorted(vals, key=lambda x: (x[1].get("rate", 0))):
+    for m, res in sorted(vals, key=lambda x: _rate(x[1])):
         v, p = res.get("validator_model", "?"), res.get("prover_model", "?")
         honest = (v == p)
-        rate = res.get("rate", 0.0)
+        rate = _rate(res)
         fraud = res.get("fraud_detected")
         thresh = calib.get(v) or res.get("p_mismatch") or m.get("p_mismatch") or 0.1
         vbe, pbe = _backend(m.get("attention_backend")), _backend(m.get("prover_profile"))
@@ -257,13 +273,13 @@ def calibration_section(recs):
     import math
     from collections import defaultdict
     vals = [(r["meta"], r["results"]) for r in recs
-            if r.get("meta", {}).get("role") == "validate" and "rate" in r.get("results", {})]
+            if r.get("meta", {}).get("role") == "validate" and _has_rate(r.get("results", {}))]
     if not vals:
         return "<p class=na>no validation runs</p>"
     g = defaultdict(lambda: {"hs": [], "hx": [], "fr": []})
     for m, res in vals:
         v, p = res.get("validator_model", "?"), res.get("prover_model", "?")
-        rate = res.get("rate", 0.0)
+        rate = _rate(res)
         vbe, pbe = _backend(m.get("attention_backend")), _backend(m.get("prover_profile"))
         same_be = (vbe == pbe and vbe != "?")
         bucket = "hs" if (v == p and same_be) else ("hx" if v == p else "fr")
@@ -423,7 +439,7 @@ def render(recs):
             _g(meta0, "quantization", default="")] if x and x != "?")
         # Coverage counts — the report adapts to however many pairs/configs were run.
         n_perf = sum(1 for r in rs if _is_perf(r))
-        sep = [r for r in rs if r.get("meta", {}).get("role") == "validate" and "rate" in r.get("results", {})]
+        sep = [r for r in rs if r.get("meta", {}).get("role") == "validate" and _has_rate(r.get("results", {}))]
         n_h = sum(1 for r in sep if r["results"].get("validator_model") == r["results"].get("prover_model"))
         n_f = len(sep) - n_h
         n_gsm = sum(1 for r in rs if r.get("meta", {}).get("role") == "gsm8k")

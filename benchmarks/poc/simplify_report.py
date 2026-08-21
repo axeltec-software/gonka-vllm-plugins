@@ -12,6 +12,22 @@ import argparse, glob, json, math, os, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # benchmarks/poc_perf
 import thresholds   # ONE artifact-derived acceptance-line calculator (k + vector)
 
+def _rate(res):
+    """Mismatch rate as a FRACTION from either schema: results.rate
+    (fraction, our collect.py) or results.rate_pct (percent, campaign
+    bundles)."""
+    if res.get("rate") is not None:
+        return float(res["rate"])
+    if res.get("rate_pct") is not None:
+        return float(res["rate_pct"]) / 100.0
+    return 0.0
+
+
+def _has_rate(res):
+    return res.get("rate") is not None or res.get("rate_pct") is not None
+
+
+
 _IDEAL_CSS = """:root{--ink:#0f172a;--mut:#64748b;--line:#e2e8f0;--bg:#f1f5f9;--card:#fff;--blue:#2563eb;--green:#16a34a;--red:#dc2626}
 *{box-sizing:border-box}
 body{font:16px/1.6 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,system-ui,sans-serif;margin:0;padding:2.5rem 1.25rem;color:var(--ink);background:var(--bg)}
@@ -190,7 +206,7 @@ for f in sorted(glob.glob(f"{D}/val_*.json")):
         lab = f"{lab} · xHW⇐{pgpu}"; prof = f"{prof} · xHW ({pgpu}⇐{vgpu})"
     vsc = (r.get("vector_score") or {}).get("mean_dist")       # absolute cosine distance (None if not emitted)
     vpn = (r.get("vector_score") or {}).get("per_nonce", [])   # per-nonce vector detail (mean_dist per nonce)
-    vals.append((lab, r.get("rate", 0)*100, honest, r.get("per_nonce", []), prof, vsc, vpn, vgpu, pgpu))
+    vals.append((lab, _rate(r)*100, honest, r.get("per_nonce", []), prof, vsc, vpn, vgpu, pgpu))
 if vals:
     hon = [v for v in vals if v[2]]; fr = [v for v in vals if not v[2]]
     hmax = max((v[1] for v in hon), default=0); fmin = min((v[1] for v in fr), default=0)
