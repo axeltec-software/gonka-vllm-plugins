@@ -220,8 +220,23 @@ if vals:
     if a.vector_line is not None: thr_v = a.vector_line
     kline = thr_k if thr_k is not None else P_MISMATCH                      # production line as fallback
     thr = thr_k                                                            # alias used by the charts
-    _cfg = lambda p: (("cudagraph" if str(p).split(" ")[0].startswith("cg") else "eager"),
-                      ("FlashInfer" if "flashinfer" in str(p) else "FlashAttn"))
+    def _cfg(p):
+        # Only trust the tag when it actually carries an engine profile;
+        # campaign files without one must read "unknown", not "eager".
+        ps = str(p or "")
+        if ps.startswith("cg"):
+            eng = "cudagraph"
+        elif ps.startswith("eager"):
+            eng = "eager"
+        else:
+            eng = "unknown-engine"
+        if "flashinfer" in ps:
+            bk = "FlashInfer"
+        elif ps.startswith(("cg", "eager")):
+            bk = "FlashAttn"
+        else:
+            bk = "unknown-backend"
+        return eng, bk
     v_eng, v_bk = _cfg(meta.get("profile", "cg-flashattn"))    # validator config — READ from the artifact meta
     validator_cfg = f"{v_eng} · {v_bk}"
     rows = ""
