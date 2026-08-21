@@ -370,7 +370,7 @@ index 0000000000..906db98b2d
 +    assert len(mgr._free_slots) > 0 or st is not None
 diff --git a/tests/poc/unit/test_bias_bound.py b/tests/poc/unit/test_bias_bound.py
 new file mode 100644
-index 0000000000..a4584ca948
+index 0000000000..c600c95fc6
 --- /dev/null
 +++ b/tests/poc/unit/test_bias_bound.py
 @@ -0,0 +1,54 @@
@@ -387,9 +387,10 @@ index 0000000000..a4584ca948
 +layers, max over layers of per-layer max-min). Re-measure if a checkpoint
 +revision changes.
 +
-+On the modular kernel path selection is OVERRIDDEN post-engine
-+(PoCSelectOverride), so these bounds no longer gate correctness there;
-+they still gate the logit-forcing cover used for monolithic kernels.
++The selection override is NOT installed (it collapsed honest/fraud
++separability — see PR #2); the engine's selection over the forced ladder
++is again the production path, so these bounds GATE CORRECTNESS on every
++model whose scoring adds e_score_correction_bias.
 +"""
 +import math
 +
@@ -420,20 +421,19 @@ index 0000000000..a4584ca948
 +
 +def test_kimi_k2_bias_exceeds_forcing_bound():
 +    """Kimi-K2's worst layer has bias spread 0.7832 > sigmoid(1) = 0.7311:
-+    LOGIT forcing alone cannot survive it — which is why selection is not
-+    reproduced through the engine but OVERRIDDEN after it
-+    (PoCSelectOverride; see test_grouped_forcing override-immunity test).
-+    The measurement stays pinned: it is the reason the override exists,
-+    and the logit-forcing fallback (monolithic kernels) remains subject to
-+    this bound. If this test FAILS the checkpoint changed: re-measure."""
++    logit forcing alone cannot survive it. With the selection override
++    retired (separability, PR #2), this bound is a LIVE production blocker
++    for Kimi-K2 until the forcing values are strengthened (spec change,
++    joint sign-off) or the checkpoint changes. If this test FAILS the
++    checkpoint changed: re-measure."""
 +    spread, _ = MEASURED_MAX_SPREAD["moonshotai/Kimi-K2-Instruct"]
 +    assert spread > SIGMOID_GAP
 diff --git a/tests/poc/unit/test_expert_pick.py b/tests/poc/unit/test_expert_pick.py
 new file mode 100644
-index 0000000000..343fdbeee6
+index 0000000000..939b6d646e
 --- /dev/null
 +++ b/tests/poc/unit/test_expert_pick.py
-@@ -0,0 +1,141 @@
+@@ -0,0 +1,176 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""The seeded expert pick: contiguous run (start = seed % n, k consecutive).
 +
@@ -510,7 +510,42 @@ index 0000000000..343fdbeee6
 +    assert abs(float(w8[0]) - 0.6318) < 1e-3
 +
 +
-+# --------------------------------------- selection override (the real seam)
++# ------------------------------ engine selection recovers the seeded set
++def test_engine_selection_recovers_seeded_set_real_selector():
++    """With the override retired, the ENGINE's selection over the forced
++    ladder is the production path again: it must recover exactly the seeded
++    set for every real model configuration (sigmoid ± realistic bias,
++    softmax without bias). On CUDA the bias branch runs the production
++    fused kernel."""
++    from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import (
++        grouped_topk)
++    import pytest
++    dev = torch.device("cuda") if torch.cuda.is_available() else DEV
++    n_experts, top_k = 64, 6
++    base = torch.tensor([11, 222, 3333, 44444], dtype=torch.int64, device=dev)
++    steps = torch.tensor([0, 1, 7, 255], dtype=torch.int64, device=dev)
++    forced = g.expert_logits_from_base(base, steps, n_experts, top_k, dev)
++    seeded = torch.topk(forced, top_k).indices.sort().values
++    hidden = torch.randn(4, 16, device=dev)
++
++    def sel(scoring, bias, n_group=1, topk_group=1):
++        _, ids = grouped_topk(hidden, forced, top_k, False, n_group,
++                              topk_group, scoring, 1.0, bias)
++        return ids.to(torch.int64).sort().values
++
++    assert torch.equal(sel("softmax", None), seeded)      # V2-family
++    assert torch.equal(sel("sigmoid", None), seeded)      # MiniMax-family
++    if dev.type == "cuda":
++        gen = torch.Generator().manual_seed(7)
++        bias = (torch.randn(n_experts, generator=gen) * 0.1).to(dev)
++        assert torch.equal(sel("sigmoid", bias), seeded)  # V3/Kimi regime
++        # beyond the sigmoid gap the bias overrides the pick — the LIVE
++        # Kimi-K2 limitation pinned in test_bias_bound
++        adv = torch.zeros(n_experts, device=dev); adv[0] = 0.8
++        assert not torch.equal(sel("sigmoid", adv), seeded)
++
++
++# --------------- selection override (class RETAINED, NOT INSTALLED — PR #2)
 +def test_select_override_discards_engine_selection_for_poc_rows():
 +    from vllm.poc.native import PoCSelectOverride, _install_poc_select_patch
 +
@@ -3559,7 +3594,7 @@ index 0000000000..cd0b5c2f53
 +
 diff --git a/vllm/poc/native.py b/vllm/poc/native.py
 new file mode 100644
-index 0000000000..696e7123b8
+index 0000000000..04f1a1e415
 --- /dev/null
 +++ b/vllm/poc/native.py
 @@ -0,0 +1,597 @@
@@ -5144,10 +5179,10 @@ index 0000000000..7a2156a891
 +        )
 diff --git a/vllm/poc/sphere.py b/vllm/poc/sphere.py
 new file mode 100644
-index 0000000000..3440965240
+index 0000000000..c7b8e11e29
 --- /dev/null
 +++ b/vllm/poc/sphere.py
-@@ -0,0 +1,198 @@
+@@ -0,0 +1,210 @@
 +"""PoC sphere codebook: project a hidden-state slice onto an equidistant
 +codebook on the unit sphere and snap it to the nearest point (sphere_k).
 +
@@ -5281,11 +5316,23 @@ index 0000000000..3440965240
 +        logger.info("PoC sphere codebook: loaded frozen reference (sha256=%s)",
 +                    digest[:16])
 +    else:
-+        cb = build_equidistant_codebook(SPHERE_POINTS, SPHERE_DIM)
-+        logger.warning(
-+            "PoC sphere codebook: %s missing, REBUILT via Adam (sha256=%s) — "
-+            "NOT consensus-safe across nodes", _CODEBOOK_FILE,
-+            _codebook_sha256(cb)[:16])
++        if os.environ.get("VLLM_POC_ALLOW_REBUILT_CODEBOOK") == "1":
++            # Offline-experiments escape hatch only.
++            cb = build_equidistant_codebook(SPHERE_POINTS, SPHERE_DIM)
++            logger.warning(
++                "PoC sphere codebook: REBUILT via Adam (sha256=%s) — NOT "
++                "consensus-safe across nodes", _codebook_sha256(cb)[:16])
++        else:
++            # Fail-loud: a rebuilt codebook is NOT bit-reproducible (Adam
++            # backward varies across torch/BLAS/HW), so a node running one
++            # silently produces non-consensus artifacts that still LOOK
++            # valid. Refuse to serve.
++            raise FileNotFoundError(
++                f"PoC sphere codebook missing at {_CODEBOOK_FILE}; a rebuilt "
++                "codebook is not consensus-safe. Ship the frozen file "
++                f"(sha256={EXPECTED_CODEBOOK_SHA256[:16]}…) — see "
++                "residual/CODEBOOK.md. Set VLLM_POC_ALLOW_REBUILT_CODEBOOK=1 "
++                "only for offline experiments.")
 +
 +    _SPHERE_CODEBOOK = cb
 +    return cb
@@ -5348,8 +5395,48 @@ index 0000000000..3440965240
 +    return k, bad, margin
 diff --git a/vllm/poc/sphere_codebook.pt b/vllm/poc/sphere_codebook.pt
 new file mode 100644
-index 0000000000..c7ab3c6b6b
-Binary files /dev/null and b/vllm/poc/sphere_codebook.pt differ
+index 0000000000000000000000000000000000000000..c7ab3c6b6bee20912c5afd5fff89023dec116d2e
+GIT binary patch
+literal 18017
+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
+
+literal 0
+HcmV?d00001
+
 diff --git a/vllm/poc/validation.py b/vllm/poc/validation.py
 new file mode 100644
 index 0000000000..dbbf082145

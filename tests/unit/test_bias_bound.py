@@ -11,9 +11,10 @@ The spreads below were measured from the published checkpoints
 layers, max over layers of per-layer max-min). Re-measure if a checkpoint
 revision changes.
 
-On the modular kernel path selection is OVERRIDDEN post-engine
-(PoCSelectOverride), so these bounds no longer gate correctness there;
-they still gate the logit-forcing cover used for monolithic kernels.
+The selection override is NOT installed (it collapsed honest/fraud
+separability — see PR #2); the engine's selection over the forced ladder
+is again the production path, so these bounds GATE CORRECTNESS on every
+model whose scoring adds e_score_correction_bias.
 """
 import math
 
@@ -44,11 +45,10 @@ def test_deepseek_v3_bias_within_forcing_bound():
 
 def test_kimi_k2_bias_exceeds_forcing_bound():
     """Kimi-K2's worst layer has bias spread 0.7832 > sigmoid(1) = 0.7311:
-    LOGIT forcing alone cannot survive it — which is why selection is not
-    reproduced through the engine but OVERRIDDEN after it
-    (PoCSelectOverride; see test_grouped_forcing override-immunity test).
-    The measurement stays pinned: it is the reason the override exists,
-    and the logit-forcing fallback (monolithic kernels) remains subject to
-    this bound. If this test FAILS the checkpoint changed: re-measure."""
+    logit forcing alone cannot survive it. With the selection override
+    retired (separability, PR #2), this bound is a LIVE production blocker
+    for Kimi-K2 until the forcing values are strengthened (spec change,
+    joint sign-off) or the checkpoint changes. If this test FAILS the
+    checkpoint changed: re-measure."""
     spread, _ = MEASURED_MAX_SPREAD["moonshotai/Kimi-K2-Instruct"]
     assert spread > SIGMOID_GAP

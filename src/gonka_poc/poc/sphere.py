@@ -10,9 +10,9 @@ from typing import Optional
 
 import torch
 
-from vllm.logger import init_logger
+import logging
 
-logger = init_logger(__name__)
+logger = logging.getLogger(__name__)
 
 # SPHERE_DIM: dimension of the hidden-state slice projected onto the sphere.
 # SPHERE_POINTS: number of equidistant codebook points on that sphere.
@@ -131,11 +131,23 @@ def get_sphere_codebook() -> torch.Tensor:
         logger.info("PoC sphere codebook: loaded frozen reference (sha256=%s)",
                     digest[:16])
     else:
-        cb = build_equidistant_codebook(SPHERE_POINTS, SPHERE_DIM)
-        logger.warning(
-            "PoC sphere codebook: %s missing, REBUILT via Adam (sha256=%s) — "
-            "NOT consensus-safe across nodes", _CODEBOOK_FILE,
-            _codebook_sha256(cb)[:16])
+        if os.environ.get("VLLM_POC_ALLOW_REBUILT_CODEBOOK") == "1":
+            # Offline-experiments escape hatch only.
+            cb = build_equidistant_codebook(SPHERE_POINTS, SPHERE_DIM)
+            logger.warning(
+                "PoC sphere codebook: REBUILT via Adam (sha256=%s) — NOT "
+                "consensus-safe across nodes", _codebook_sha256(cb)[:16])
+        else:
+            # Fail-loud: a rebuilt codebook is NOT bit-reproducible (Adam
+            # backward varies across torch/BLAS/HW), so a node running one
+            # silently produces non-consensus artifacts that still LOOK
+            # valid. Refuse to serve.
+            raise FileNotFoundError(
+                f"PoC sphere codebook missing at {_CODEBOOK_FILE}; a rebuilt "
+                "codebook is not consensus-safe. Ship the frozen file "
+                f"(sha256={EXPECTED_CODEBOOK_SHA256[:16]}…) — see "
+                "residual/CODEBOOK.md. Set VLLM_POC_ALLOW_REBUILT_CODEBOOK=1 "
+                "only for offline experiments.")
 
     _SPHERE_CODEBOOK = cb
     return cb

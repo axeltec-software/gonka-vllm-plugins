@@ -74,7 +74,42 @@ def test_ladder_softmax_weights_are_frozen_constants():
     assert abs(float(w8[0]) - 0.6318) < 1e-3
 
 
-# --------------------------------------- selection override (the real seam)
+# ------------------------------ engine selection recovers the seeded set
+def test_engine_selection_recovers_seeded_set_real_selector():
+    """With the override retired, the ENGINE's selection over the forced
+    ladder is the production path again: it must recover exactly the seeded
+    set for every real model configuration (sigmoid ± realistic bias,
+    softmax without bias). On CUDA the bias branch runs the production
+    fused kernel."""
+    from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import (
+        grouped_topk)
+    import pytest
+    dev = torch.device("cuda") if torch.cuda.is_available() else DEV
+    n_experts, top_k = 64, 6
+    base = torch.tensor([11, 222, 3333, 44444], dtype=torch.int64, device=dev)
+    steps = torch.tensor([0, 1, 7, 255], dtype=torch.int64, device=dev)
+    forced = g.expert_logits_from_base(base, steps, n_experts, top_k, dev)
+    seeded = torch.topk(forced, top_k).indices.sort().values
+    hidden = torch.randn(4, 16, device=dev)
+
+    def sel(scoring, bias, n_group=1, topk_group=1):
+        _, ids = grouped_topk(hidden, forced, top_k, False, n_group,
+                              topk_group, scoring, 1.0, bias)
+        return ids.to(torch.int64).sort().values
+
+    assert torch.equal(sel("softmax", None), seeded)      # V2-family
+    assert torch.equal(sel("sigmoid", None), seeded)      # MiniMax-family
+    if dev.type == "cuda":
+        gen = torch.Generator().manual_seed(7)
+        bias = (torch.randn(n_experts, generator=gen) * 0.1).to(dev)
+        assert torch.equal(sel("sigmoid", bias), seeded)  # V3/Kimi regime
+        # beyond the sigmoid gap the bias overrides the pick — the LIVE
+        # Kimi-K2 limitation pinned in test_bias_bound
+        adv = torch.zeros(n_experts, device=dev); adv[0] = 0.8
+        assert not torch.equal(sel("sigmoid", adv), seeded)
+
+
+# --------------- selection override (class RETAINED, NOT INSTALLED — PR #2)
 def test_select_override_discards_engine_selection_for_poc_rows():
     from gonka_poc.mixed.native import PoCSelectOverride, _install_poc_select_patch
 
