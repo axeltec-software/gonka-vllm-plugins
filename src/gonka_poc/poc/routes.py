@@ -23,6 +23,24 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/pow", tags=["PoC"])
 
+def _server_engine() -> dict:
+    """Engine identity of the SERVING box: version/commit, attention backend,
+    cudagraph mode. Server truth — never recorded client-side."""
+    out = {}
+    try:
+        import vllm
+        out["vllm_version"] = getattr(vllm, "__version__", "?")
+    except Exception:
+        pass
+    try:
+        import os
+        out["attention_backend"] = os.environ.get("VLLM_ATTENTION_BACKEND", "auto")
+        out["v2_runner"] = os.environ.get("VLLM_USE_V2_MODEL_RUNNER", "?")
+    except Exception:
+        pass
+    return out
+
+
 def _server_gpu() -> str:
     """The SERVING box's GPU — provenance must name the machine that computed
     the artifacts, not whatever client collected them."""
@@ -624,6 +642,7 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
                              "vllm_config", None), "cache_config", None),
                              "poc_route_window", 256)},
             "server_gpu": _server_gpu(),
+            "server_engine": _server_engine(),
         }
     
     validation_result = run_validation(
@@ -648,6 +667,7 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
         # verdict-only response otherwise (unchanged).
         "artifacts": computed_artifacts if body.debug else [],
         "server_gpu": _server_gpu(),
+            "server_engine": _server_engine(),
         **validation_result,
     }
 

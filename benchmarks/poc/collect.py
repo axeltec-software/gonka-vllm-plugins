@@ -46,7 +46,8 @@ def cmd_generate(a):
             "max_tokens": a.max_tokens, "k_dim": KDIM, "block_hash": BH, "public_key": PK,
             "codebook_hash": CODEBOOK_HASH, "nonces": nonces, "batch_size": 0,
             "per_nonce_reflection": a.per_nonce_reflection, **a.prov, "client_gpu": a.prov.get("gpu"),
-            "gpu": resp.get("server_gpu") or a.prov.get("gpu")}
+            "gpu": resp.get("server_gpu") or a.prov.get("gpu"),
+            "server_engine": resp.get("server_engine")}
     save_run(a.save, meta, arts,
              results={"nonces_per_s": round(nps, 3), "steps_per_s": round(nps * (a.max_tokens + 1), 1),
                       "elapsed_s": round(secs, 1)})
@@ -78,7 +79,8 @@ def cmd_validate(a):
             "prover_gpu": rmeta.get("gpu"),  # HW the ref was generated on (cross-HW: != this validator's gpu)
             "nonces": nonces, "batch_size": 0, "ref": a.ref,
             "prover_engine": rmeta.get("engine"), "prover_profile": rmeta.get("profile"), **a.prov, "client_gpu": a.prov.get("gpu"),
-            "gpu": resp.get("server_gpu") or a.prov.get("gpu")}
+            "gpu": resp.get("server_gpu") or a.prov.get("gpu"),
+            "server_engine": resp.get("server_engine")}
     save_run(a.save, meta, resp.get("artifacts", []),
              results={"validator_model": a.model, "prover_model": rmeta["model"], "honest": honest,
                       "rate": rate, "n_mismatch": resp["n_mismatch"], "fraud_detected": resp["fraud_detected"],

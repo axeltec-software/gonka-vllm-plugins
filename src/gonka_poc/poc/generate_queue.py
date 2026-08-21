@@ -15,6 +15,24 @@ from gonka_poc.poc.poc_params import PoCParams
 logger = logging.getLogger(__name__)
 
 
+def _server_engine() -> dict:
+    """Engine identity of the SERVING box: version/commit, attention backend,
+    cudagraph mode. Server truth — never recorded client-side."""
+    out = {}
+    try:
+        import vllm
+        out["vllm_version"] = getattr(vllm, "__version__", "?")
+    except Exception:
+        pass
+    try:
+        import os
+        out["attention_backend"] = os.environ.get("VLLM_ATTENTION_BACKEND", "auto")
+        out["v2_runner"] = os.environ.get("VLLM_USE_V2_MODEL_RUNNER", "?")
+    except Exception:
+        pass
+    return out
+
+
 def _server_gpu() -> str:
     """The SERVING box's GPU — provenance names the machine that computed the
     artifacts, never the client that collected them."""
@@ -372,6 +390,7 @@ class GenerateQueue:
                 "encoding": {"dtype": "f16", "k_dim": job.k_dim, "endian": "le",
                              "route_window": job.route_window},
                 "server_gpu": _server_gpu(),
+            "server_engine": _server_engine(),
             }
         
         validation_result = run_validation(
@@ -390,6 +409,7 @@ class GenerateQueue:
             "status": "completed",
             "request_id": job.request_id,
             "server_gpu": _server_gpu(),
+            "server_engine": _server_engine(),
             **validation_result,
             # parity with the inline wait=true path (routes.py): debug requests
             # get the validator-side artifacts (sph_values_steps) back too.

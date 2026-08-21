@@ -223,6 +223,12 @@ if vals:
     def _cfg(p):
         # Only trust the tag when it actually carries an engine profile;
         # campaign files without one must read "unknown", not "eager".
+        # server-reported engine identity beats any client-side tag
+        if isinstance(p, dict):
+            eng = "v1-runner" if str(p.get("v2_runner")) == "0" else \
+                  ("v2-runner" if str(p.get("v2_runner")) == "1" else "unknown-engine")
+            bk = p.get("attention_backend", "unknown-backend")
+            return eng, bk
         ps = str(p or "")
         if ps.startswith("cg"):
             eng = "cudagraph"
@@ -237,7 +243,7 @@ if vals:
         else:
             bk = "unknown-backend"
         return eng, bk
-    v_eng, v_bk = _cfg(meta.get("profile", "cg-flashattn"))    # validator config — READ from the artifact meta
+    v_eng, v_bk = _cfg(meta.get("server_engine") or meta.get("profile"))  # server truth first
     validator_cfg = f"{v_eng} · {v_bk}"
     rows = ""
     any_vec = any(v[5] is not None for v in vals)             # vector channel present?
