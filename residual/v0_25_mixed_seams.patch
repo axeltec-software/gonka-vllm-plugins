@@ -4143,13 +4143,13 @@ index 0000000000..696e7123b8
 +        _gate = moe.gate
 +        _install_poc_patch(_gate, PoCRouterWrapper(
 +            _gate, route_base, state.route_step, n_exp, top_k, state.mask))
-+        # Selection override (modular kernel path): the authoritative seam.
-+        # The gate-logit forcing above stays as cover for monolithic kernels
-+        # that fuse routing into the expert kernel.
-+        _router = getattr(moe.experts, "router", None)
-+        if _router is not None:
-+            _install_poc_select_patch(_router, PoCSelectOverride(
-+                route_base, state.route_step, n_exp, top_k, state.mask))
++        # The gate-logit forcing above is the single routing seam, as in
++        # 0.20. The selection override is NOT installed: replacing the
++        # engine's expert weights with the ladder softmax collapses the
++        # honest/fraud gap — AWQ fraud validates at ~75% mismatches instead
++        # of ~11-13%, and any numeric input difference (quant, cross-GPU)
++        # saturates at the same ceiling. Measured on 1xB300, MiniMax-M2.7
++        # vs its AWQ checkpoint; disabling restores the 0.20-level gap.
 +
 +    model._poc_native_state = state
 +    logger.info(
