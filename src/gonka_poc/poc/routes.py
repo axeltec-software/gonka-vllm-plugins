@@ -9,19 +9,31 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Request, HTTPException
 from pydantic import BaseModel, ConfigDict
 
-from vllm.logger import init_logger
-from .config import PoCState
-from .data import Artifact, DEFAULT_DIST_THRESHOLD, DEFAULT_P_MISMATCH, DEFAULT_FRAUD_THRESHOLD
-from .callbacks import CallbackSender
-from .generate_queue import (
+import logging
+from gonka_poc.poc.config import PoCState
+from gonka_poc.poc.data import Artifact, DEFAULT_DIST_THRESHOLD, DEFAULT_P_MISMATCH, DEFAULT_FRAUD_THRESHOLD
+from gonka_poc.poc.callbacks import CallbackSender
+from gonka_poc.poc.generate_queue import (
     GenerateJob, get_queue, clear_queue, POC_MAX_QUEUED_NONCES,
     compute_nonce_artifacts,
 )
-from .validation import run_validation
+from gonka_poc.poc.validation import run_validation
 
-logger = init_logger(__name__)
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/pow", tags=["PoC"])
+
+def _server_gpu() -> str:
+    """The SERVING box's GPU — provenance must name the machine that computed
+    the artifacts, not whatever client collected them."""
+    try:
+        import torch
+        n = torch.cuda.device_count()
+        return f"{n}x{torch.cuda.get_device_name(0)}" if n else "cpu"
+    except Exception:
+        return "?"
+
+
 
 POC_CALLBACK_INTERVAL_SEC = float(os.environ.get("POC_CALLBACK_INTERVAL_SEC", "5"))
 POC_GENERATE_CHUNK_TIMEOUT_SEC = float(os.environ.get("POC_GENERATE_CHUNK_TIMEOUT_SEC", "60"))
@@ -611,6 +623,7 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
                          "route_window": getattr(getattr(getattr(engine_client,
                              "vllm_config", None), "cache_config", None),
                              "poc_route_window", 256)},
+            "server_gpu": _server_gpu(),
         }
     
     validation_result = run_validation(
@@ -634,6 +647,7 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
         # client can pair them with the prover's for offline vector-channel analysis;
         # verdict-only response otherwise (unchanged).
         "artifacts": computed_artifacts if body.debug else [],
+        "server_gpu": _server_gpu(),
         **validation_result,
     }
 

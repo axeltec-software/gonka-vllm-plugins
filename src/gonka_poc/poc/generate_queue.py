@@ -6,13 +6,25 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
-from vllm.logger import init_logger
-from .validation import run_validation
-from .callbacks import get_callback_queue, clear_callback_queue
-from .data import DEFAULT_DIST_THRESHOLD, DEFAULT_P_MISMATCH, DEFAULT_FRAUD_THRESHOLD
-from .poc_params import PoCParams
+import logging
+from gonka_poc.poc.validation import run_validation
+from gonka_poc.poc.callbacks import get_callback_queue, clear_callback_queue
+from gonka_poc.poc.data import DEFAULT_DIST_THRESHOLD, DEFAULT_P_MISMATCH, DEFAULT_FRAUD_THRESHOLD
+from gonka_poc.poc.poc_params import PoCParams
 
-logger = init_logger(__name__)
+logger = logging.getLogger(__name__)
+
+
+def _server_gpu() -> str:
+    """The SERVING box's GPU — provenance names the machine that computed the
+    artifacts, never the client that collected them."""
+    try:
+        import torch
+        n = torch.cuda.device_count()
+        return f"{n}x{torch.cuda.get_device_name(0)}" if n else "cpu"
+    except Exception:
+        return "?"
+
 
 
 async def compute_nonce_artifacts(
@@ -359,6 +371,7 @@ class GenerateQueue:
                 "artifacts": computed_artifacts,
                 "encoding": {"dtype": "f16", "k_dim": job.k_dim, "endian": "le",
                              "route_window": job.route_window},
+                "server_gpu": _server_gpu(),
             }
         
         validation_result = run_validation(
@@ -376,6 +389,7 @@ class GenerateQueue:
         return {
             "status": "completed",
             "request_id": job.request_id,
+            "server_gpu": _server_gpu(),
             **validation_result,
             # parity with the inline wait=true path (routes.py): debug requests
             # get the validator-side artifacts (sph_values_steps) back too.
