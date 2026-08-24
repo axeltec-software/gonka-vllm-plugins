@@ -263,7 +263,11 @@ if vals:
             seeds = sorted({x[9][0] for x in g if x[9] and x[9][0]})
             parts = sorted({x[9][1] for x in g if x[9] and x[9][1]})
             base = list(g[0])[:9]
-            base[1] = sum(rates) / len(rates)      # mean for ordering/display
+            # WORST case for this row's kind — the number a threshold must
+            # survive: honest closest to the line from below (max), fraud
+            # closest from above (min). A mean would hide exactly the run
+            # that decides the verdict.
+            base[1] = rates[-1] if key[1] else rates[0]
             base.append((len(g), rates[0], rates[-1], seeds, parts))
             collapsed.append(tuple(base))
         vals = collapsed
@@ -298,7 +302,7 @@ if vals:
             if seeds: axes.append(f"{len(seeds)} seeds ({'/'.join(seeds)})")
             if parts: axes.append("parts " + "/".join(str(p) for p in parts))
             rate_cell = (f"{rate:.2f}% <span style='color:#94a3b8;font-size:.85em'>"
-                         f"mean · {n} runs · {lo:.2f}–{hi_r:.2f}%"
+                         f"worst of {n} runs · range {lo:.2f}–{hi_r:.2f}%"
                          + (" · " + " · ".join(axes) if axes else "") + "</span>")
         else:
             rate_cell = f"{rate:.2f}%"
