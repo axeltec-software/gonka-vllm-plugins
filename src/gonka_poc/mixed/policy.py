@@ -51,9 +51,18 @@ def poc_step_num_tokens(poc_params, num_computed_tokens: int) -> int:
     return poc_params.seq_len
 
 
-def poc_share_budget(poc_share: float, token_budget: int) -> int:
+def poc_share_budget(poc_share: float, token_budget: int,
+                     chat_present: bool = True) -> int:
     """PoC's slice of a step's compute (token) budget. poc_share=0 -> PoC blocked
-    this step; 1.0 -> PoC may use the whole budget. Pure (unit-testable)."""
+    this step; 1.0 -> PoC may use the whole budget. Pure (unit-testable).
+
+    The share exists to stop PoC starving chat, so it only applies while chat is
+    actually in the engine: with no chat request queued or running, reserving a
+    slice for it just idles the step (PoC-only nodes prefill nonces in twice the
+    steps they need). poc_share=0 still blocks PoC either way — an explicit
+    "chat only" instruction, not a reservation."""
+    if not chat_present and poc_share > 0.0:
+        return token_budget
     return int(poc_share * token_budget)
 
 

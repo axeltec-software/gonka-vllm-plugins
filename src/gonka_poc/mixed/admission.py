@@ -45,6 +45,9 @@ class PoCAdmission:
         )
         if not self.active:
             return
+        chat_present = any(
+            r.poc_params is None for q in queues for r in q
+        )
 
         cache_config = scheduler.cache_config
         # Resolve here, not at config init: num_gpu_blocks is only known once
@@ -59,7 +62,8 @@ class PoCAdmission:
                 cache_config.poc_max_tokens,
             ),
         )
-        self._token_budget = poc_share_budget(cache_config.poc_share, token_budget)
+        self._token_budget = poc_share_budget(
+            cache_config.poc_share, token_budget, chat_present)
         self._scheduled = 0
         self._tokens = 0
 

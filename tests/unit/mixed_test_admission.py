@@ -91,11 +91,43 @@ def test_both_decoding_mix_together():
 
 # --------------------------------------------------------------- budget & caps
 def test_poc_share_caps_poc_tokens():
+    """The share is a reservation FOR CHAT, so it binds while chat is in the
+    engine — hence a chat row in the queue here."""
     poc_req = _req(poc=True, computed=5)
-    a = PoCAdmission(_sched(running=[poc_req], share=0.5), 100)  # budget 50
+    a = PoCAdmission(
+        _sched(running=[_req(computed=10, prompt=8), poc_req], share=0.5), 100)
     assert a.over_budget(poc_req, 40) is False
     a.note_scheduled(poc_req, 40)
     assert a.over_budget(poc_req, 20) is True  # 40+20 > 50
+
+
+def test_share_is_not_reserved_when_no_chat_is_present():
+    """PoC-only node (or a PoC window between chat traffic): holding a slice for
+    a chat request that does not exist just idles the step — nonces would prefill
+    in twice the steps they need."""
+    poc_req = _req(poc=True, computed=5)
+    a = PoCAdmission(_sched(running=[poc_req], share=0.5), 100)
+    assert a.over_budget(poc_req, 100) is False   # whole budget, not 50
+    a.note_scheduled(poc_req, 100)
+    assert a.over_budget(poc_req, 1) is True      # still bounded by the budget
+
+
+def test_waiting_chat_request_still_counts_as_present():
+    """Chat queued but not yet running must keep its reservation, or PoC would
+    take the whole step and the chat row would never get admitted."""
+    poc_req = _req(poc=True, computed=5)
+    a = PoCAdmission(
+        _sched(running=[poc_req], waiting=[_req(computed=0, prompt=8)],
+               share=0.5), 100)
+    assert a.over_budget(poc_req, 60) is True     # capped back to 50
+
+
+def test_share_zero_still_blocks_poc_without_chat():
+    """0.0 is an explicit "chat only" instruction, not a reservation: it must
+    not be reinterpreted as "no chat present, so let PoC through"."""
+    poc_req = _req(poc=True, computed=5)
+    a = PoCAdmission(_sched(running=[poc_req], share=0.0), 100)
+    assert a.over_budget(poc_req, 1) is True
 
 
 def test_poc_share_never_limits_chat():
