@@ -206,7 +206,8 @@ for f in sorted(glob.glob(f"{D}/val_*.json")):
         lab = f"{lab} · xHW⇐{pgpu}"; prof = f"{prof} · xHW ({pgpu}⇐{vgpu})"
     vsc = (r.get("vector_score") or {}).get("mean_dist")       # absolute cosine distance (None if not emitted)
     vpn = (r.get("vector_score") or {}).get("per_nonce", [])   # per-nonce vector detail (mean_dist per nonce)
-    vals.append((lab, _rate(r)*100, honest, r.get("per_nonce", []), prof, vsc, vpn, vgpu, pgpu))
+    axes = (m.get("block_hash_id"), m.get("val_partition"))
+    vals.append((lab, _rate(r)*100, honest, r.get("per_nonce", []), prof, vsc, vpn, vgpu, pgpu, axes))
 if vals:
     hon = [v for v in vals if v[2]]; fr = [v for v in vals if not v[2]]
     hmax = max((v[1] for v in hon), default=0); fmin = min((v[1] for v in fr), default=0)
@@ -259,13 +260,15 @@ if vals:
         collapsed = []
         for key, g in _g.items():
             rates = sorted(x[1] for x in g)
-            base = list(g[0])
+            seeds = sorted({x[9][0] for x in g if x[9] and x[9][0]})
+            parts = sorted({x[9][1] for x in g if x[9] and x[9][1]})
+            base = list(g[0])[:9]
             base[1] = sum(rates) / len(rates)      # mean for ordering/display
-            base.append((len(g), rates[0], rates[-1]))   # (n, min, max)
+            base.append((len(g), rates[0], rates[-1], seeds, parts))
             collapsed.append(tuple(base))
         vals = collapsed
     else:
-        vals = [tuple(list(v) + [None]) for v in vals]
+        vals = [tuple(list(v)[:9] + [None]) for v in vals]
     vals.sort(key=lambda v: (not v[2], v[1]))                 # honest block first (asc), then fraud (asc)
     for lab, rate, honest, _pn, _pr, vsc, _vpn, _vgpu, _pgpu, _agg in vals:
         cls = "good-t" if honest else "bad-t"
@@ -290,9 +293,13 @@ if vals:
             what = f"fraud · {' · '.join(diffs)}" if diffs else "fraud detection (identical GPU + engine)"
         vstr = (f"{vsc:.1e}" if vsc is not None else "—")
         if _agg and _agg[0] > 1:                       # collapsed repeats
-            n, lo, hi_r = _agg
+            n, lo, hi_r, seeds, parts = _agg
+            axes = []
+            if seeds: axes.append(f"{len(seeds)} seeds ({'/'.join(seeds)})")
+            if parts: axes.append("parts " + "/".join(str(p) for p in parts))
             rate_cell = (f"{rate:.2f}% <span style='color:#94a3b8;font-size:.85em'>"
-                         f"mean · {n} runs · {lo:.2f}–{hi_r:.2f}%</span>")
+                         f"mean · {n} runs · {lo:.2f}–{hi_r:.2f}%"
+                         + (" · " + " · ".join(axes) if axes else "") + "</span>")
         else:
             rate_cell = f"{rate:.2f}%"
         rows += (f"<tr{hi}><td>{prod}{note}</td><td><b>{_vgpu}</b> · {validator_cfg}</td><td class={cls}>{what}</td>"

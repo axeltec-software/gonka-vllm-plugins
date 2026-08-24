@@ -79,6 +79,10 @@ def main():
             "plugin_version": m.get("plugin_version"),
             "public_key": m.get("public_key"), "timestamp": m.get("timestamp"),
             "campaign_source": os.path.basename(f),
+            # axes the campaign varies across repeats — surfaced in the report
+            "block_hash_id": next((t for t in parts if t.startswith("h")
+                                   and t[1:].isdigit()), None),
+            "val_partition": m.get("val_partition") or res.get("partition"),
         }
         results = {
             "validator_model": meta["validator_model"],
