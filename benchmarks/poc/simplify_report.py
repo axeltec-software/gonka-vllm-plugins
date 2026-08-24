@@ -247,8 +247,27 @@ if vals:
     validator_cfg = f"{v_eng} · {v_bk}"
     rows = ""
     any_vec = any(v[5] is not None for v in vals)             # vector channel present?
+    # Campaign data repeats each configuration (partitions x hashes x repeats),
+    # which renders as dozens of identical-looking rows. Collapse repeats into
+    # one row carrying n and the observed range; the acceptance line above is
+    # still computed from EVERY individual run (extremes matter, means don't).
+    _g = {}
+    for v in vals:
+        key = (v[0], v[2], v[4], v[7], v[8])       # label, honest, prof, vgpu, pgpu
+        _g.setdefault(key, []).append(v)
+    if any(len(g) > 1 for g in _g.values()):
+        collapsed = []
+        for key, g in _g.items():
+            rates = sorted(x[1] for x in g)
+            base = list(g[0])
+            base[1] = sum(rates) / len(rates)      # mean for ordering/display
+            base.append((len(g), rates[0], rates[-1]))   # (n, min, max)
+            collapsed.append(tuple(base))
+        vals = collapsed
+    else:
+        vals = [tuple(list(v) + [None]) for v in vals]
     vals.sort(key=lambda v: (not v[2], v[1]))                 # honest block first (asc), then fraud (asc)
-    for lab, rate, honest, _pn, _pr, vsc, _vpn, _vgpu, _pgpu in vals:
+    for lab, rate, honest, _pn, _pr, vsc, _vpn, _vgpu, _pgpu, _agg in vals:
         cls = "good-t" if honest else "bad-t"
         ok = (rate < kline) if honest else (rate > kline)   # artifact-derived k line (thresholds.py)
         vd = ("honest ✓" if ok else "honest ✗ false-pos") if honest else ("fraud ✓" if ok else "fraud ✗ MISSED")
@@ -270,8 +289,14 @@ if vals:
         else:
             what = f"fraud · {' · '.join(diffs)}" if diffs else "fraud detection (identical GPU + engine)"
         vstr = (f"{vsc:.1e}" if vsc is not None else "—")
+        if _agg and _agg[0] > 1:                       # collapsed repeats
+            n, lo, hi_r = _agg
+            rate_cell = (f"{rate:.2f}% <span style='color:#94a3b8;font-size:.85em'>"
+                         f"mean · {n} runs · {lo:.2f}–{hi_r:.2f}%</span>")
+        else:
+            rate_cell = f"{rate:.2f}%"
         rows += (f"<tr{hi}><td>{prod}{note}</td><td><b>{_vgpu}</b> · {validator_cfg}</td><td class={cls}>{what}</td>"
-                 f"<td class=num>{rate:.2f}%</td><td class=num>{vstr}</td><td class={vdcls}>{vd}</td></tr>")
+                 f"<td class=num>{rate_cell}</td><td class=num>{vstr}</td><td class={vdcls}>{vd}</td></tr>")
     passed = (not hon or hmax < kline) and (not fr or fmin > kline)
     vec_th = "<th class=num>vector: mean dist</th>"
     thr_row = (f'<tr class=hi><td><b>acceptance line · from artifacts</b></td><td>—</td>'
