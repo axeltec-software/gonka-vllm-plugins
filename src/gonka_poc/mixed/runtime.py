@@ -380,6 +380,7 @@ def build_unified_mixed_batch_inputs(
     # Decode-step embeddings are generated in ONE batched call after this loop
     # (was per-nonce). Each entry: (decode_state, decode_step, offset).
     decode_embed_jobs = []
+    decode_positions: list[int] = []
 
     for req_idx in range(num_reqs):
         req_id = req_ids[req_idx]
@@ -410,8 +411,11 @@ def build_unified_mixed_batch_inputs(
                         poc_params.block_hash, poc_params.public_key,
                         [poc_params.nonce], runner.device)
                 decode_embed_jobs.append((st, decode_step, offset))
-                unified_positions[offset] = req_state.num_computed_tokens
-                poc_position_mask[offset] = True
+                # Positions/mask for decode rows are written in ONE batched
+                # index_copy_/index_fill_ after the loop: a per-row scalar
+                # assignment is a separate H2D copy (~25 us/row/step at batch
+                # 1024 it dominated the whole step).
+                decode_positions.append(req_state.num_computed_tokens)
                 poc_metadata.append({
                     'type': 'poc', 'req_id': req_id, 'start_idx': offset,
                     'length': 1, 'poc_params': poc_params,
@@ -462,13 +466,22 @@ def build_unified_mixed_batch_inputs(
     # Batched decode-step embeddings: one generate_decode_inputs_gpu call for the
     # whole nonce-batch (per-row identical to the old per-nonce calls).
     from gonka_poc.poc.gpu_random import generate_decode_inputs_gpu, pinned_to_device
+    decode_offs = (pinned_to_device([j[2] for j in decode_embed_jobs],
+                                    torch.long, runner.device)
+                   if decode_embed_jobs else None)
+    if decode_offs is not None:
+        unified_positions.index_copy_(
+            0, decode_offs,
+            pinned_to_device(decode_positions, unified_positions.dtype,
+                             runner.device))
+        poc_position_mask.index_fill_(0, decode_offs, True)
     _nat = getattr(runner, "_poc_native", None)
     if _nat is not None and getattr(_nat, "embed_base", None) is not None:
         # SYNTH = EMBEDDING: publish per-row (base, prev_k, step); the embedding
         # wrapper synths input[step] in-graph. No eager RNG, no [B,H] embed copy.
         if decode_embed_jobs:
             _nat.set_decode_chain(
-                offs=pinned_to_device([j[2] for j in decode_embed_jobs], torch.long, runner.device),
+                offs=decode_offs,
                 base=torch.cat([j[0].base_seeds for j in decode_embed_jobs]),
                 prev_k=torch.cat([j[0].prev_k_t for j in decode_embed_jobs]),
                 step=pinned_to_device([j[1] for j in decode_embed_jobs], torch.int64, runner.device))
@@ -481,8 +494,7 @@ def build_unified_mixed_batch_inputs(
         embeds = generate_decode_inputs_gpu(
             base_seeds, prev_k, steps,
             dim=hidden_size, device=runner.device, dtype=runner.dtype)  # [B, 1, H]
-        offs = pinned_to_device([j[2] for j in decode_embed_jobs], torch.long, runner.device)
-        unified_embeds.index_copy_(0, offs, embeds[:, 0])   # [B, H] -> rows offs
+        unified_embeds.index_copy_(0, decode_offs, embeds[:, 0])  # [B, H] -> rows
 
     return unified_embeds, unified_positions, poc_position_mask, poc_metadata
 
