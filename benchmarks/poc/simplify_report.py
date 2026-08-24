@@ -462,8 +462,34 @@ def _khist(fn):
             if isinstance(k, int) and k >= 0: c[k] = c.get(k, 0) + 1
     tot = sum(c.values())
     return ([100*c.get(i, 0)/tot for i in range(16)] if tot else None), tot
+def _khist_kind(honest, cap=4):
+    """Fallback for campaign sessions with no gen_* corpus files: aggregate
+    k-points from up to `cap` validation artifacts of the requested kind
+    (coverage is distributional — a few files are millions of samples)."""
+    c, tot, used = {}, 0, 0
+    for fn in sorted(glob.glob(f"{D}/val_*.json")):
+        if used >= cap:
+            break
+        try:
+            d = L(fn)
+        except Exception:
+            continue
+        if bool(d.get("results", {}).get("honest")) != honest:
+            continue
+        used += 1
+        for a in d.get("artifacts", []):
+            for k in (a.get("k_points_steps") or []):
+                if isinstance(k, int) and k >= 0:
+                    c[k] = c.get(k, 0) + 1
+    tot = sum(c.values())
+    return ([100*c.get(i, 0)/tot for i in range(16)] if tot else None), tot
+
 hon_k, nh = _khist("gen_honest_cg-flashattn.json")
 fra_k, nf = _khist("gen_fraud_cg-flashattn.json")
+if not hon_k:
+    hon_k, nh = _khist_kind(True)
+if not fra_k:
+    fra_k, nf = _khist_kind(False)
 if hon_k:
     W, H, PAD, BW = 860, 300, 44, 20; plotH = H - 2*PAD
     series = [("#2563eb", hon_k)] + ([("#dc2626", fra_k)] if fra_k else [])
