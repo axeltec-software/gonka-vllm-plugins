@@ -141,3 +141,53 @@ def test_per_row_device_writes_do_not_scale_with_batch(monkeypatch):
     assert counts[2] == counts[64], (
         f"element-wise writes scale with batch: {counts} — the decode-row "
         "positions/mask must be written in one batched op")
+
+
+def _mixed_batch():
+    """Realistic mixed step: chat rows and PoC decode rows in one forward, in
+    scheduler order. The batched write must land ONLY on the PoC offsets — a
+    wrong index tensor would silently overwrite a chat row's position (RoPE)
+    and corrupt that chat request while leaving PoC artifacts intact."""
+    req_ids = ["chat-0", "poc-0", "chat-1", "poc-1"]
+    tokens = {"chat-0": 2, "poc-0": 1, "chat-1": 1, "poc-1": 1}
+    native = _Native()
+    mgr = {"poc-0": _state(), "poc-1": _state()}
+    runner = SimpleNamespace(
+        model_config=SimpleNamespace(get_hidden_size=lambda: HIDDEN),
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        _poc_native=native,
+        _poc_mixed_decode_mgr=SimpleNamespace(get=mgr.get),
+    )
+    sched = SimpleNamespace(num_scheduled_tokens=tokens)
+    views = {
+        "poc-0": SimpleNamespace(poc_params=_params(0, 64),
+                                 num_computed_tokens=70),
+        "poc-1": SimpleNamespace(poc_params=_params(1, 64),
+                                 num_computed_tokens=81),
+    }
+    total = sum(tokens.values())
+    chat_positions = torch.tensor([11, 12, 99, 13, 99], dtype=torch.long)[:total]
+    chat_embeds = torch.arange(total * HIDDEN, dtype=torch.float32).reshape(
+        total, HIDDEN)
+    return build_unified_mixed_batch_inputs(
+        runner, sched, None, chat_embeds, chat_positions,
+        {"poc-0", "poc-1"}, total, (len(req_ids), req_ids), views,
+    )
+
+
+def test_mixed_batch_writes_land_only_on_poc_rows():
+    embeds, positions, mask, meta = _mixed_batch()
+    # order: chat-0 (offsets 0,1), poc-0 (2), chat-1 (3), poc-1 (4)
+    assert mask.tolist() == [False, False, True, False, True]
+    assert positions.tolist() == [11, 12, 70, 13, 81]
+    assert [(m["req_id"], m["start_idx"]) for m in meta] == [
+        ("poc-0", 2), ("poc-1", 4)]
+
+
+def test_mixed_batch_leaves_chat_embeddings_untouched():
+    """Chat rows must come out of a mixed step bit-identical to stock vLLM."""
+    embeds, _, _, _ = _mixed_batch()
+    expected = torch.arange(5 * HIDDEN, dtype=torch.float32).reshape(5, HIDDEN)
+    for row in (0, 1, 3):
+        assert torch.equal(embeds[row], expected[row]), f"chat row {row} altered"
