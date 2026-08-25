@@ -526,20 +526,48 @@ class PoCNativeState:
             cache = self._seed_cache
             if len(cache) > 262144:
                 cache.clear()
-            for i, base_buf in enumerate(self._route_base):
-                vals = []
-                for bh, nz in zip(row_hashes, row_nonces):
-                    if bh is None:
-                        vals.append(0)
-                        continue
+            # Table PER UNIQUE (block_hash, nonce), not per row. In prefill the
+            # rows are tokens, so building the value list row-by-row did
+            # n_layers x n_rows (62 x 8192 = 507,904) cache lookups and list
+            # appends per chunk — pure host work that showed up as one ~60 ms
+            # stall per prefill forward. The host now fills n_layers x n_unique
+            # (62 x ~tens) and the per-row expansion runs ON DEVICE via
+            # index_select. Column 0 is reserved for rows without a block_hash
+            # (the original wrote 0 for those).
+            n_rows = len(row_hashes)
+            n_layers = len(self._route_base)
+            uniq: dict = {}
+            row_col = [0] * n_rows
+            for _r, (bh, nz) in enumerate(zip(row_hashes, row_nonces)):
+                if bh is None:
+                    continue
+                k = (bh, nz)
+                j = uniq.get(k)
+                if j is None:
+                    j = len(uniq) + 1
+                    uniq[k] = j
+                row_col[_r] = j
+            tab = [[0] * (len(uniq) + 1) for _ in range(n_layers)]
+            for (bh, nz), j in uniq.items():
+                for i in range(n_layers):
                     ck = (bh, nz, i)
                     v = cache.get(ck)
                     if v is None:
                         v = _seed_from_string(route_base_seed(bh, nz, i))
                         cache[ck] = v
-                    vals.append(v)
-                base_buf[:len(vals)].copy_(
-                    torch.tensor(vals, dtype=torch.int64, device=self.device))
+                    tab[i][j] = v
+            # ONE blocking upload of [n_layers, n_unique+1] instead of n_layers
+            # separate ones: each separate upload pulled its own
+            # cudaStreamSynchronize (62 of the ~145 per prefill forward) and a
+            # 64 KiB H2D copy. The per-buffer fan-out below is device-to-device
+            # and cheap. Same values in the same order -> bit-identical result.
+            # Do NOT make this upload async: the pinned-buffer variant raced the
+            # in-flight forward and corrupted the tail rows of the mapping (see
+            # the note above).
+            tab_t = torch.tensor(tab, dtype=torch.int64, device=self.device)
+            idx_t = torch.tensor(row_col, dtype=torch.long, device=self.device)
+            for i, base_buf in enumerate(self._route_base):
+                base_buf[:n_rows] = tab_t[i].index_select(0, idx_t)
             self._base_key = base_key
         key = (base_key, tuple(row_steps))
         if key == self._last_route_key:                      # nothing changed -> skip
