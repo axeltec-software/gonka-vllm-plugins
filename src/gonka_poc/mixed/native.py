@@ -372,6 +372,7 @@ class PoCNativeState:
         self.route_step = torch.zeros(max_tokens, dtype=torch.int64, device=device)
         self.router_meta: list = []                 # [(n_experts, top_k), ...]
         self._route_base: list = []                 # per-layer [max_tokens] int64 sha256 base (cached)
+        self._seed_cache: dict = {}                 # (block_hash,nonce,layer) -> sha256 base value
         self._base_key: tuple | None = None         # (hashes,nonces) the base was built for
         self._last_route_key: tuple | None = None   # skip refresh if (hashes,nonces,steps) unchanged
         # PoC-as-a-sampler, part 1: SYNTH = EMBEDDING. The next decode input is the
@@ -470,12 +471,26 @@ class PoCNativeState:
             return
         for buf in self.vectors:
             buf.zero_()
+        # BATCHED scatter. The per-row variant issued num_layers x B separate
+        # copy_ calls (62 layers x 512 rows = 31,744 cudaMemcpyAsync of one
+        # hidden_size row each), and the GPU sat idle between them. The decode
+        # cache above hides this for a stable batch, but in PREFILL the rows are
+        # tokens, so refl_key changes on every chunk and the full scatter
+        # re-ran each time — nsys showed prefill forwards at ~23% GPU busy from
+        # this alone. Rows sharing (block_hash, refl_nonce) get the SAME layer
+        # vector, so num_layers x n_groups indexed writes suffice. Every
+        # (row, layer) cell is written exactly once with the same value and the
+        # same dtype cast -> bit-identical to the per-row scatter.
+        groups: dict = {}
         for row, (bh, nz) in enumerate(zip(row_hashes, row_refl_nonces)):
             if bh is None:
                 continue
+            groups.setdefault((bh, nz), []).append(row)
+        for (bh, nz), rows in groups.items():
+            rows_t = pinned_to_device(rows, torch.int64, self.device)
             vs = self._vectors_for(bh, nz)
             for i, buf in enumerate(self.vectors):
-                buf[row].copy_(vs[i].to(buf.dtype))
+                buf[rows_t] = vs[i].to(buf.dtype)
         self._last_refl_key = refl_key
         _assert_replicated_across_tp(self.vectors[0], "reflection_vectors[0]")
         # (reflection vectors depend on block_hash [+ nonce when per-nonce seeded],
@@ -497,9 +512,32 @@ class PoCNativeState:
             return
         base_key = (tuple(row_hashes), tuple(row_nonces))
         if base_key != self._base_key:                       # rebuild cached base (host, ONCE/mapping)
+            # The sha256 base depends ONLY on (block_hash, nonce, layer), never
+            # on the row. In prefill the rows are tokens — thousands per chunk
+            # over a few dozen unique nonces — and base_key changes on every
+            # chunk, so the direct rebuild hashed num_layers x n_rows strings
+            # per chunk on the host while the GPU waited. Memoizing per
+            # (block_hash, nonce, layer) yields THE SAME values at
+            # num_layers x n_unique_nonces hashes.
+            # NB: the upload below stays the blocking torch.tensor(...) on
+            # purpose — swapping it for pinned_to_device raced the shared
+            # pinned buffer against the in-flight forward and corrupted the
+            # tail rows of the mapping (observed on the partition tail).
+            cache = self._seed_cache
+            if len(cache) > 262144:
+                cache.clear()
             for i, base_buf in enumerate(self._route_base):
-                vals = [_seed_from_string(route_base_seed(bh, nz, i)) if bh is not None else 0
-                        for bh, nz in zip(row_hashes, row_nonces)]
+                vals = []
+                for bh, nz in zip(row_hashes, row_nonces):
+                    if bh is None:
+                        vals.append(0)
+                        continue
+                    ck = (bh, nz, i)
+                    v = cache.get(ck)
+                    if v is None:
+                        v = _seed_from_string(route_base_seed(bh, nz, i))
+                        cache[ck] = v
+                    vals.append(v)
                 base_buf[:len(vals)].copy_(
                     torch.tensor(vals, dtype=torch.int64, device=self.device))
             self._base_key = base_key
