@@ -31,6 +31,12 @@ from gonka_poc.poc.gpu_random import (expert_logits_from_base, generate_househol
 _DEBUG_TP = os.environ.get("VLLM_POC_DEBUG_TP") == "1"
 
 
+# Block hashes kept in the router-seed memo. One scope holds a round's
+# nonces; a new round makes the old scope unreachable, so a handful is
+# enough to cover interleaved rounds while bounding dead entries.
+_SEED_CACHE_MAX_SCOPES = 8
+
+
 def _assert_replicated_across_tp(t: torch.Tensor, name: str) -> None:
     """No-op unless VLLM_POC_DEBUG_TP=1 and TP world size > 1. Fingerprints `t`
     (3 moments) and all-gathers across the TP group, asserting bit-equality so a
@@ -353,16 +359,21 @@ class PoCNativeState:
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.max_tokens = max_tokens
-        self.vectors = [
-            torch.zeros(max_tokens, hidden_size, device=device, dtype=dtype)
-            for _ in range(num_layers)
-        ]
+        # ONE [layers, rows, hidden] buffer; self.vectors keeps the per-layer
+        # entries as VIEWS into it, so the layer wrappers are unchanged. Zeroing
+        # is then one kernel instead of num_layers, and a group's reflection
+        # vector lands in every layer with one indexed write instead of one per
+        # layer (62 on MiniMax-M2, per prefill chunk).
+        self.vectors_t, self.vectors = self.alloc_vectors(
+            num_layers, max_tokens, hidden_size, device, dtype)
         self.mask = torch.zeros(max_tokens, dtype=torch.bool, device=device)
         self.embeds = torch.zeros(max_tokens, hidden_size, device=device, dtype=dtype)
         # (block_hash, nonce-or-None) -> per-layer vectors. nonce=None is the
         # per-block scheme (one draw shared by every nonce of the block); an int
         # nonce is the per-nonce scheme (each nonce gets its own draw).
+        self._seed_cache: dict = {}     # block_hash -> {nonce: per-layer bases}
         self._hash_cache: dict[tuple, list] = {}
+        self._stack_cache: dict = {}   # (hash, nonce) -> [layers, hidden] stack
         self._last_refl_key: tuple | None = None    # skip redundant per-step rescatter
         # seeded-routing (MANDATORY for MoE; filled by attach_native_poc): per-MoE-layer
         # cached seed base [max_tokens] int64 (block_hash,nonce,layer, hashed once per
@@ -372,7 +383,6 @@ class PoCNativeState:
         self.route_step = torch.zeros(max_tokens, dtype=torch.int64, device=device)
         self.router_meta: list = []                 # [(n_experts, top_k), ...]
         self._route_base: list = []                 # per-layer [max_tokens] int64 sha256 base (cached)
-        self._seed_cache: dict = {}                 # (block_hash,nonce,layer) -> sha256 base value
         self._base_key: tuple | None = None         # (hashes,nonces) the base was built for
         self._last_route_key: tuple | None = None   # skip refresh if (hashes,nonces,steps) unchanged
         # PoC-as-a-sampler, part 1: SYNTH = EMBEDDING. The next decode input is the
@@ -426,6 +436,23 @@ class PoCNativeState:
     # wholesale past the cap (regeneration is cheap, seeded host murmur).
     _HASH_CACHE_MAX = 256
 
+    @staticmethod
+    def alloc_vectors(num_layers, max_tokens, hidden_size, device, dtype):
+        """Contiguous reflection buffer + per-layer views onto it."""
+        buf = torch.zeros(num_layers, max_tokens, hidden_size,
+                          device=device, dtype=dtype)
+        return buf, list(buf)
+
+    def _stacked_vectors_for(self, block_hash: str, nonce: int | None = None):
+        """[num_layers, hidden] stack of the per-layer vectors, cached alongside
+        the list form so the batched scatter never re-stacks."""
+        key = (block_hash, nonce)
+        st = self._stack_cache.get(key)
+        if st is None:
+            st = torch.stack(self._vectors_for(block_hash, nonce))
+            self._stack_cache[key] = st
+        return st
+
     def _vectors_for(self, block_hash: str, nonce: int | None = None) -> list:
         """Per-layer reflection vectors for (block_hash, nonce) (cached across
         forwards). nonce=None -> the per-block seed (production default); an int
@@ -436,6 +463,7 @@ class PoCNativeState:
         if vs is None:
             if len(self._hash_cache) >= self._HASH_CACHE_MAX:
                 self._hash_cache.clear()
+                self._stack_cache.clear()
             suffix = ("" if nonce is None else f"_nonce{nonce}")
             # Cache in the buffer dtype: halves the footprint vs the generator's
             # fp32 and matches what the scatter writes (copy_ casts identically).
@@ -469,18 +497,10 @@ class PoCNativeState:
         refl_key = (tuple(row_hashes), tuple(row_refl_nonces))
         if refl_key == self._last_refl_key:
             return
-        for buf in self.vectors:
-            buf.zero_()
-        # BATCHED scatter. The per-row variant issued num_layers x B separate
-        # copy_ calls (62 layers x 512 rows = 31,744 cudaMemcpyAsync of one
-        # hidden_size row each), and the GPU sat idle between them. The decode
-        # cache above hides this for a stable batch, but in PREFILL the rows are
-        # tokens, so refl_key changes on every chunk and the full scatter
-        # re-ran each time — nsys showed prefill forwards at ~23% GPU busy from
-        # this alone. Rows sharing (block_hash, refl_nonce) get the SAME layer
-        # vector, so num_layers x n_groups indexed writes suffice. Every
-        # (row, layer) cell is written exactly once with the same value and the
-        # same dtype cast -> bit-identical to the per-row scatter.
+        self.vectors_t.zero_()
+        # Rows sharing (block_hash, refl_nonce) get the SAME layer vector, so
+        # scatter per group, not per row: the per-row form issued num_layers x B
+        # one-row copies and starved the prefill forward (23% GPU busy).
         groups: dict = {}
         for row, (bh, nz) in enumerate(zip(row_hashes, row_refl_nonces)):
             if bh is None:
@@ -488,9 +508,8 @@ class PoCNativeState:
             groups.setdefault((bh, nz), []).append(row)
         for (bh, nz), rows in groups.items():
             rows_t = pinned_to_device(rows, torch.int64, self.device)
-            vs = self._vectors_for(bh, nz)
-            for i, buf in enumerate(self.vectors):
-                buf[rows_t] = vs[i].to(buf.dtype)
+            # one write covers every layer: [L, n_rows, hidden] <- [L, 1, hidden]
+            self.vectors_t[:, rows_t, :] = self._stacked_vectors_for(bh, nz).unsqueeze(1)
         self._last_refl_key = refl_key
         _assert_replicated_across_tp(self.vectors[0], "reflection_vectors[0]")
         # (reflection vectors depend on block_hash [+ nonce when per-nonce seeded],
@@ -512,28 +531,13 @@ class PoCNativeState:
             return
         base_key = (tuple(row_hashes), tuple(row_nonces))
         if base_key != self._base_key:                       # rebuild cached base (host, ONCE/mapping)
-            # The sha256 base depends ONLY on (block_hash, nonce, layer), never
-            # on the row. In prefill the rows are tokens — thousands per chunk
-            # over a few dozen unique nonces — and base_key changes on every
-            # chunk, so the direct rebuild hashed num_layers x n_rows strings
-            # per chunk on the host while the GPU waited. Memoizing per
-            # (block_hash, nonce, layer) yields THE SAME values at
-            # num_layers x n_unique_nonces hashes.
-            # NB: the upload below stays the blocking torch.tensor(...) on
-            # purpose — swapping it for pinned_to_device raced the shared
-            # pinned buffer against the in-flight forward and corrupted the
-            # tail rows of the mapping (observed on the partition tail).
+            # The sha256 base depends only on (block_hash, nonce, layer), never
+            # on the row, so memoize it: prefill rows are tokens, thousands per
+            # chunk over a few dozen nonces.
             cache = self._seed_cache
-            if len(cache) > 262144:
-                cache.clear()
-            # Table PER UNIQUE (block_hash, nonce), not per row. In prefill the
-            # rows are tokens, so building the value list row-by-row did
-            # n_layers x n_rows (62 x 8192 = 507,904) cache lookups and list
-            # appends per chunk — pure host work that showed up as one ~60 ms
-            # stall per prefill forward. The host now fills n_layers x n_unique
-            # (62 x ~tens) and the per-row expansion runs ON DEVICE via
-            # index_select. Column 0 is reserved for rows without a block_hash
-            # (the original wrote 0 for those).
+            # Table per unique (block_hash, nonce); the per-row expansion runs
+            # on device via index_select. Column 0 holds rows with no
+            # block_hash (the per-row form wrote 0 for those).
             n_rows = len(row_hashes)
             n_layers = len(self._route_base)
             uniq: dict = {}
@@ -548,22 +552,29 @@ class PoCNativeState:
                     uniq[k] = j
                 row_col[_r] = j
             tab = [[0] * (len(uniq) + 1) for _ in range(n_layers)]
+            # Scoped by block_hash, one entry per NONCE holding the per-layer
+            # bases. A new round brings a new hash, which makes the previous
+            # round's entries unreachable (the key contains the hash) — so bound
+            # the memo by SCOPES rather than by a nonce count: garbage is at most
+            # a few dead rounds, and no live scope is dropped. Evicting everything
+            # absent from the current mapping would be tighter but thrashes, since
+            # rows carry their own hash and two rounds can interleave step to step.
             for (bh, nz), j in uniq.items():
+                scope = cache.get(bh)
+                if scope is None:
+                    scope = cache[bh] = {}
+                vals = scope.get(nz)
+                if vals is None:
+                    vals = scope[nz] = tuple(
+                        _seed_from_string(route_base_seed(bh, nz, i))
+                        for i in range(n_layers))
                 for i in range(n_layers):
-                    ck = (bh, nz, i)
-                    v = cache.get(ck)
-                    if v is None:
-                        v = _seed_from_string(route_base_seed(bh, nz, i))
-                        cache[ck] = v
-                    tab[i][j] = v
-            # ONE blocking upload of [n_layers, n_unique+1] instead of n_layers
-            # separate ones: each separate upload pulled its own
-            # cudaStreamSynchronize (62 of the ~145 per prefill forward) and a
-            # 64 KiB H2D copy. The per-buffer fan-out below is device-to-device
-            # and cheap. Same values in the same order -> bit-identical result.
-            # Do NOT make this upload async: the pinned-buffer variant raced the
-            # in-flight forward and corrupted the tail rows of the mapping (see
-            # the note above).
+                    tab[i][j] = vals[i]
+            while len(cache) > _SEED_CACHE_MAX_SCOPES:
+                cache.pop(next(iter(cache)))          # oldest round, now unreachable
+            # One upload of [n_layers, n_unique+1]; the fan-out below is D2D.
+            # Keep it blocking: the async variant corrupted the tail rows of
+            # the mapping against the in-flight forward (cause not confirmed).
             tab_t = torch.tensor(tab, dtype=torch.int64, device=self.device)
             idx_t = torch.tensor(row_col, dtype=torch.long, device=self.device)
             for i, base_buf in enumerate(self._route_base):

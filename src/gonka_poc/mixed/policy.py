@@ -51,18 +51,19 @@ def poc_step_num_tokens(poc_params, num_computed_tokens: int) -> int:
     return poc_params.seq_len
 
 
-def poc_share_budget(poc_share: float, token_budget: int) -> int:
+def poc_share_budget(poc_share: float, token_budget: int,
+                     chat_present: bool = True) -> int:
     """PoC's slice of a step's compute (token) budget. poc_share=0 -> PoC blocked
-    this step; 1.0 -> PoC may use the whole budget. Pure (unit-testable)."""
+    this step; 1.0 -> PoC may use the whole budget. Pure (unit-testable).
+
+    The share exists to stop PoC starving chat, so it only applies while chat is
+    actually in the engine: with no chat request queued or running, reserving a
+    slice for it just idles the step (PoC-only nodes prefill nonces in twice the
+    steps they need). poc_share=0 still blocks PoC either way — an explicit
+    "chat only" instruction, not a reservation."""
+    if not chat_present and poc_share > 0.0:
+        return token_budget
     return int(poc_share * token_budget)
-
-
-def resolve_poc_max_batch_size(configured: int, max_num_seqs: int) -> int:
-    """The per-step PoC nonce cap. `configured` == 0 means AUTO -> use the engine's
-    own concurrency limit (max_num_seqs), so PoC fills the batch like inference does
-    instead of being pinned to a fixed constant that throttles it on bigger machines.
-    Any explicit >0 value is honored verbatim. Pure (unit-testable)."""
-    return max_num_seqs if configured == 0 else configured
 
 
 def poc_alloc_footprint(poc_params, num_new_tokens: int) -> int:
@@ -72,3 +73,26 @@ def poc_alloc_footprint(poc_params, num_new_tokens: int) -> int:
     if poc_is_pure_path(poc_params):
         return poc_params.seq_len + poc_params.max_tokens
     return num_new_tokens
+
+
+# PoC knobs live in our fork's CacheConfig. On a stock vLLM those attributes do
+# not exist and the plugin must still run — that is the point of shipping it as a
+# plugin — so every read goes through poc_cfg() and falls back to the SAME value
+# the fork declares. The table is pinned against the fork's CacheConfig by a test;
+# if a default drifts, consensus-relevant behaviour (route window, seq_len,
+# max_tokens) would silently differ between a fork deploy and a stock deploy.
+POC_CONFIG_DEFAULTS = {
+    "poc_max_batch_size": 0,
+    "poc_seq_len": 256,
+    "poc_max_tokens": 256,
+    "poc_share": 1.0,
+    "poc_route_window": 256,
+    "poc_vector_artifacts": False,
+}
+
+
+def poc_cfg(cache_config, name: str):
+    """Read a PoC knob from a CacheConfig that may not define it."""
+    if name not in POC_CONFIG_DEFAULTS:
+        raise KeyError(f"unknown PoC config knob: {name}")
+    return getattr(cache_config, name, POC_CONFIG_DEFAULTS[name])

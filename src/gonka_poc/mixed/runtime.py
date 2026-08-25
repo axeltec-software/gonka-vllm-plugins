@@ -91,7 +91,9 @@ def slice_sampling_metadata(sm, rows, device):
     avoids stale/oversized penalty tensors and the per-row param mismatch."""
     import dataclasses
 
-    idx = torch.tensor(rows, device=device, dtype=torch.long)
+    from gonka_poc.poc.gpu_random import pinned_to_device
+
+    idx = pinned_to_device(rows, torch.long, device)
     keep = set(rows)
     remap = {old: new for new, old in enumerate(rows)}
 
@@ -380,6 +382,7 @@ def build_unified_mixed_batch_inputs(
     # Decode-step embeddings are generated in ONE batched call after this loop
     # (was per-nonce). Each entry: (decode_state, decode_step, offset).
     decode_embed_jobs = []
+    decode_positions: list[int] = []
 
     for req_idx in range(num_reqs):
         req_id = req_ids[req_idx]
@@ -409,9 +412,12 @@ def build_unified_mixed_batch_inputs(
                     st.base_seeds = decode_base_seeds(
                         poc_params.block_hash, poc_params.public_key,
                         [poc_params.nonce], runner.device)
-                decode_embed_jobs.append((st, decode_step, offset))
-                unified_positions[offset] = req_state.num_computed_tokens
-                poc_position_mask[offset] = True
+                decode_embed_jobs.append((st, decode_step, offset, poc_params.nonce))
+                # Positions/mask for decode rows are written in ONE batched
+                # index_copy_/index_fill_ after the loop: a per-row scalar
+                # assignment is a separate H2D copy (~25 us/row/step at batch
+                # 1024 it dominated the whole step).
+                decode_positions.append(req_state.num_computed_tokens)
                 poc_metadata.append({
                     'type': 'poc', 'req_id': req_id, 'start_idx': offset,
                     'length': 1, 'poc_params': poc_params,
@@ -462,27 +468,61 @@ def build_unified_mixed_batch_inputs(
     # Batched decode-step embeddings: one generate_decode_inputs_gpu call for the
     # whole nonce-batch (per-row identical to the old per-nonce calls).
     from gonka_poc.poc.gpu_random import generate_decode_inputs_gpu, pinned_to_device
+    decode_offs = (pinned_to_device([j[2] for j in decode_embed_jobs],
+                                    torch.long, runner.device)
+                   if decode_embed_jobs else None)
+    if decode_offs is not None:
+        unified_positions.index_copy_(
+            0, decode_offs,
+            pinned_to_device(decode_positions, unified_positions.dtype,
+                             runner.device))
+        poc_position_mask.index_fill_(0, decode_offs, True)
+    # Chain tensors for this step. base_seeds is constant per nonce, and prev_k is
+    # what the previous step's snap already produced for the SAME rows in the SAME
+    # order — catting B one-element tensors every step was O(B) host work on the
+    # critical path. Rebuilt only when the row set changes (key = nonces in row
+    # order), or when any row is teacher-forced from a reference trajectory.
+    chain = getattr(runner, "_poc_chain", None)
+    if chain is None:
+        chain = runner._poc_chain = {}
+    # Key = rows AND the step each row is on. The nonce tuple alone repeats when a
+    # NEW round reuses the same nonces, and the stale prev_k from the previous
+    # round's last step would silently continue that chain (caught by the
+    # cross-round determinism test).
+    chain_key = ((tuple(j[3] for j in decode_embed_jobs),
+                  tuple(j[1] for j in decode_embed_jobs))
+                 if decode_embed_jobs else ())
+    base_cat = prev_cat = None
+    if decode_embed_jobs:
+        base_key = chain_key[0]
+        if chain.get("base_key") == base_key:
+            base_cat = chain["base"]
+        else:
+            base_cat = torch.cat([j[0].base_seeds for j in decode_embed_jobs])
+            chain["base_key"], chain["base"] = base_key, base_cat
+        if chain.get("prev_key") == chain_key and chain.get("prev") is not None:
+            prev_cat = chain["prev"]
+        else:
+            prev_cat = torch.cat([j[0].prev_k_t for j in decode_embed_jobs])
+        chain["prev"] = None            # consumed; the snap below publishes the next
+        chain["step_key"] = chain_key
+        chain["step_base"], chain["step_prev"] = base_cat, prev_cat
     _nat = getattr(runner, "_poc_native", None)
     if _nat is not None and getattr(_nat, "embed_base", None) is not None:
         # SYNTH = EMBEDDING: publish per-row (base, prev_k, step); the embedding
         # wrapper synths input[step] in-graph. No eager RNG, no [B,H] embed copy.
         if decode_embed_jobs:
             _nat.set_decode_chain(
-                offs=pinned_to_device([j[2] for j in decode_embed_jobs], torch.long, runner.device),
-                base=torch.cat([j[0].base_seeds for j in decode_embed_jobs]),
-                prev_k=torch.cat([j[0].prev_k_t for j in decode_embed_jobs]),
+                offs=decode_offs, base=base_cat, prev_k=prev_cat,
                 step=pinned_to_device([j[1] for j in decode_embed_jobs], torch.int64, runner.device))
         else:
             _nat.set_decode_chain()          # no decode rows in this forward
     elif decode_embed_jobs:
-        base_seeds = torch.cat([j[0].base_seeds for j in decode_embed_jobs])  # [B]
-        prev_k = torch.cat([j[0].prev_k_t for j in decode_embed_jobs])        # [B]
         steps = pinned_to_device([j[1] for j in decode_embed_jobs], torch.int64, runner.device)
         embeds = generate_decode_inputs_gpu(
-            base_seeds, prev_k, steps,
+            base_cat, prev_cat, steps,
             dim=hidden_size, device=runner.device, dtype=runner.dtype)  # [B, 1, H]
-        offs = pinned_to_device([j[2] for j in decode_embed_jobs], torch.long, runner.device)
-        unified_embeds.index_copy_(0, offs, embeds[:, 0])   # [B, H] -> rows offs
+        unified_embeds.index_copy_(0, decode_offs, embeds[:, 0])  # [B, H] -> rows
 
     return unified_embeds, unified_positions, poc_position_mask, poc_metadata
 
@@ -585,6 +625,12 @@ def process_poc_outputs_from_hidden(
     if decode_metas:
         device = runner.device
         H = hidden_states.shape[-1]
+        _chain = getattr(runner, "_poc_chain", None)
+        if _chain is None:
+            _chain = runner._poc_chain = {}
+        _metas_key = (tuple(m['poc_params'].nonce for m in decode_metas),
+                      tuple(m['decode_step'] for m in decode_metas))
+        _any_reference = False
         # Post-forward sphere-snap. The final-norm wrapper snapped every row IN-GRAPH
         # this forward, so we just index_select the decode rows (no per-step eager
         # tail). The eager path below is the fallback for models without native PoC
@@ -622,8 +668,12 @@ def process_poc_outputs_from_hidden(
                 lh = hidden_states.index_select(
                     0, pinned_to_device(idxs, torch.long, device)).float()   # [B, H]
                 lh = lh / (lh.norm(dim=-1, keepdim=True) + 1e-8)
-                base_seeds = torch.cat([m['decode_state'].base_seeds for m in decode_metas])
-                prev_k = torch.cat([m['decode_state'].prev_k_t for m in decode_metas])
+                # Same rows, same step: the batch builder already assembled these.
+                if _chain.get("step_key") == _metas_key:
+                    base_seeds, prev_k = _chain["step_base"], _chain["step_prev"]
+                else:
+                    base_seeds = torch.cat([m['decode_state'].base_seeds for m in decode_metas])
+                    prev_k = torch.cat([m['decode_state'].prev_k_t for m in decode_metas])
                 steps = pinned_to_device([m['decode_step'] for m in decode_metas], torch.int64, device)
                 sph = random_pick_indices_gpu(base_seeds, prev_k, steps, H, SPHERE_DIM, device)
                 # snap_with_margin: argmax(NaN) is garbage -> non-finite rows return k=-1
@@ -635,6 +685,7 @@ def process_poc_outputs_from_hidden(
         # views + list appends). Shared by this step's kept rows, alive until emit.
         # (_keep_any computed above, before the snap, to gate the snap_q pull.)
         q_clone = q_all.detach().clone() if _keep_any else None
+        _chain_prev_candidate = k_all.detach()
         for i, meta in enumerate(decode_metas):
             st = meta['decode_state']
             step = meta['decode_step']
@@ -646,6 +697,7 @@ def process_poc_outputs_from_hidden(
             # chain only (teacher-forced ref, or free-running k) — no per-step counters
             if st.reference_t is not None and step < st.reference_t.shape[0]:
                 st.prev_k_t = st.reference_t[step:step + 1]   # aligned (teacher-forced)
+                _any_reference = True
             else:
                 st.prev_k_t = k_t
             if step >= st.max_tokens:
@@ -690,6 +742,14 @@ def process_poc_outputs_from_hidden(
                     sph_values_steps=sph_vals,
                 )
                 get_decode_manager(runner).free(meta['req_id'])
+
+        # Publish this step's k as the next step's prev_k, still batched. Teacher-
+        # forced rows chain from the reference instead, so the whole vector is only
+        # valid when no row used one; otherwise the next build falls back to the cat.
+        if not _any_reference:
+            _chain["prev_key"], _chain["prev"] = (
+                (_metas_key[0], tuple(s + 1 for s in _metas_key[1])),
+                _chain_prev_candidate)
 
     return poc_outputs
 

@@ -35,9 +35,9 @@ def _state():
     st.hidden_size = HIDDEN
     st.num_layers = LAYERS
     st.device = torch.device("cpu")
-    st.vectors = [torch.zeros(ROWS, HIDDEN, dtype=torch.bfloat16)
-                  for _ in range(LAYERS)]
-    st._hash_cache = {}
+    st.vectors_t, st.vectors = PoCNativeState.alloc_vectors(
+        LAYERS, ROWS, HIDDEN, torch.device("cpu"), torch.bfloat16)
+    st._hash_cache, st._stack_cache = {}, {}
     st._last_refl_key = None
     st._route_base = [torch.zeros(ROWS, dtype=torch.int64)
                       for _ in range(LAYERS)]
@@ -102,7 +102,11 @@ def test_memoized_seed_base_bit_identical():
                   for bh, nz in zip(ROW_HASHES, ROW_NONCES)]
         assert st._route_base[i][:len(expect)].tolist() == expect, \
             f"layer {i} base differs from direct hashing"
-    # memoized exactly one entry per unique (bh, nonce, layer)
+    # ONE memo entry per unique (bh, nonce) — holding the per-layer bases — so the
+    # cap counts nonces and the table build does n_unique lookups, not n_unique x n_layers
     uniq = {(bh, nz) for bh, nz in zip(ROW_HASHES, ROW_NONCES)
             if bh is not None}
-    assert len(st._seed_cache) == len(uniq) * LAYERS
+    cached_nonces = {(bh, nz) for bh, scope in st._seed_cache.items() for nz in scope}
+    assert cached_nonces == uniq
+    assert all(len(v) == LAYERS
+               for scope in st._seed_cache.values() for v in scope.values())

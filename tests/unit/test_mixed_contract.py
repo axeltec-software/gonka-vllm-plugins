@@ -104,5 +104,10 @@ def test_policy_pure_functions():
     p = types.SimpleNamespace(seq_len=256, max_tokens=256)
     assert policy.poc_step_num_tokens(p, 0) == 256
     assert policy.poc_step_num_tokens(p, 256) == 1
-    assert policy.resolve_poc_max_batch_size(0, 704) == 704
-    assert policy.resolve_poc_max_batch_size(536, 704) == 536
+    # ONE definition, in runtime: the policy copy had drifted to a 2-arg form
+    # without the KV clamp, so it silently tested a function nobody calls.
+    from gonka_poc.mixed.runtime import resolve_poc_max_batch_size
+    assert resolve_poc_max_batch_size(0, 704) == 704
+    assert resolve_poc_max_batch_size(536, 704) == 536
+    assert resolve_poc_max_batch_size(0, 704, kv_capacity=128) == 128
+    assert resolve_poc_max_batch_size(536, 704, kv_capacity=128) == 536
