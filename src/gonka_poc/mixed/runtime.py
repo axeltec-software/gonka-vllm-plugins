@@ -1,4 +1,4 @@
-"""Phase 2: step-driven mixed decode-PoC support.
+"""Step-driven mixed decode-PoC support.
 
 A decode-PoC request runs ONE decode token per scheduler step, mixed with chat
 in the same forward (instead of running its whole decode loop inside one
@@ -12,14 +12,12 @@ Each PoC request carries a single nonce (routes fan out per-nonce via
 
 The slot/layout helpers at the top are pure (no torch) and unit-tested. The
 model-runner helpers at the bottom (moved out of gpu_model_runner.py to keep the
-core vLLM footprint minimal) take the GPUModelRunner as ``runner``. Decode-PoC is
-always step-driven and mixed with chat (one PoC decode token per scheduler step,
-fused into the chat forward — chat is never frozen); validation runs pure.
+core vLLM footprint minimal) take the GPUModelRunner as ``runner``. Validation
+runs pure.
 """
 import os
 from dataclasses import dataclass, field
 
-import os
 import torch
 from vllm.logger import init_logger
 
@@ -402,7 +400,7 @@ def build_unified_mixed_batch_inputs(
             st = mgr.get(req_id) if mgr is not None else None
 
             if st is not None and req_state.num_computed_tokens >= seq_len:
-                # Phase 2 decode step: one token, embed chained from prev sphere_k.
+                # Decode step: one token, embed chained from prev sphere_k.
                 # GPU-native: prev_k is a device tensor (set by the previous step's
                 # output processing) -> no host sync -> async-scheduling safe. The
                 # embedding itself is generated in ONE batched call after the loop.
@@ -488,16 +486,11 @@ def build_unified_mixed_batch_inputs(
     chain = getattr(runner, "_poc_chain", None)
     if chain is None:
         chain = runner._poc_chain = {}
-    # Key = rows AND the step each row is on. The nonce tuple alone repeats when a
-    # NEW round reuses the same nonces, and the stale prev_k from the previous
-    # round's last step would silently continue that chain (caught by the
-    # cross-round determinism test).
-    # The key carries EVERY field the cached value depends on:
-    # base_seeds = decode_base_seeds(block_hash, public_key, nonce). Keying on the
-    # nonce alone let a second round over the same nonce range with a different
-    # block_hash reuse the first round's seeds — step 0 (the prefill snap) still
-    # matched and every step after it chained from the wrong base, which reads as
-    # "state not reset when block_hash changes".
+    # The key must carry EVERY field the cached value depends on:
+    # base_seeds = decode_base_seeds(block_hash, public_key, nonce), plus the step
+    # each row is on. Keying on the nonce tuple alone let a second round over the
+    # same nonce range reuse the first round's seeds and prev_k — step 0 still
+    # matched, every later step chained from the wrong base.
     chain_key = ((tuple(j[3] for j in decode_embed_jobs),
                   tuple(j[1] for j in decode_embed_jobs))
                  if decode_embed_jobs else ())

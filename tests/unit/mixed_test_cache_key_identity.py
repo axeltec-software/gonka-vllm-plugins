@@ -138,8 +138,8 @@ def test_no_two_distinct_identities_collide():
 
 
 # --------------------------------------------------- lm-head / sampler row filter
-# Tier 2 changed how these two build their row index (blocking torch.tensor ->
-# pinned_to_device). The index is what decides WHICH rows reach the LM head and
+# These two build their row index with pinned_to_device rather than a blocking
+# torch.tensor. The index decides WHICH rows reach the LM head and
 # where sampled tokens land, so the behaviour is worth pinning, not just the
 # construction: PoC rows must never reach the LM head, and must come back as zero.
 class _Model:
