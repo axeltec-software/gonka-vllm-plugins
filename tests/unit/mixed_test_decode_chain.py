@@ -20,6 +20,21 @@ import torch
 from gonka_poc.mixed import runtime as rt
 from gonka_poc.poc.gpu_random import decode_base_seeds
 
+# The publish path builds vllm.v1.outputs.PoCOutput, a type the engine seams
+# add. CI installs a vanilla upstream wheel, where it does not exist — skip with
+# a message rather than fail with an ImportError that names the symbol but not
+# what is missing. Same convention as the residual check in
+# tests/contract/test_api_surface.py.
+try:
+    from vllm.v1.outputs import PoCOutput  # noqa: F401
+except ImportError:
+    pytest.skip(
+        "vllm.v1.outputs.PoCOutput is absent: this is a vanilla upstream wheel. "
+        "These tests exercise the publish path and need a vLLM carrying the "
+        "engine seams.",
+        allow_module_level=True,
+    )
+
 HIDDEN = 256          # >= SPHERE_DIM: the eager tail picks SPHERE_DIM coordinates
 BH, PK = "de" * 32, "ca" * 32
 CPU = torch.device("cpu")
