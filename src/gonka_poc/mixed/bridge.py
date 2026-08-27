@@ -77,24 +77,28 @@ class PoCRunnerBridge:
 
     # --------------------------------------------------------- per-step hooks
     def pre_step(self, scheduler_output: "SchedulerOutput") -> None:
-        poc_req_ids = getattr(scheduler_output, "poc_req_ids", None)
-        if not poc_req_ids:
-            self._step = None
-            return
-        # Request view comes from scheduler_output, not runner internals: V1
-        # keeps per-request objects, V2 keeps columnar tensors, but both are
-        # handed the same SchedulerOutput.
+        # Register before the early return: poc_req_ids is None whenever the
+        # scheduler saw no PoC request in its queues at the top of schedule(),
+        # yet the same step still hands newly admitted PoC rows here. Skipping
+        # registration left them unknown, and the next step — which does list
+        # them — died on KeyError inside execute_model, killing the engine.
+        # scheduled_cached_reqs cannot repair it: it carries no poc_params.
         for r in scheduler_output.scheduled_new_reqs:
             if r.poc_params is not None:
                 self._reqs[r.req_id] = _PoCRequestView(
                     r.req_id, r.poc_params, r.num_computed_tokens)
+        for rid in scheduler_output.finished_req_ids:
+            self._reqs.pop(rid, None)
+
+        poc_req_ids = getattr(scheduler_output, "poc_req_ids", None)
+        if not poc_req_ids:
+            self._step = None
+            return
         cached = scheduler_output.scheduled_cached_reqs
         for i, rid in enumerate(cached.req_ids):
             view = self._reqs.get(rid)
             if view is not None:
                 view.num_computed_tokens = cached.num_computed_tokens[i]
-        for rid in scheduler_output.finished_req_ids:
-            self._reqs.pop(rid, None)
         # Deterministic order: nonce, not set-iteration (PYTHONHASHSEED).
         poc_requests = sorted(
             (self._reqs[rid] for rid in poc_req_ids if rid in self._reqs),
@@ -225,5 +229,47 @@ class PoCRunnerBridge:
         full[idx] = chat_out.sampled_token_ids
         return SamplerOutput(
             sampled_token_ids=full,
-            logprobs_tensors=chat_out.logprobs_tensors,
+            logprobs_tensors=self._scatter_logprobs(
+                chat_out.logprobs_tensors, idx, n_full),
+        )
+
+    @staticmethod
+    def _scatter_logprobs(lp, idx, n_full: int):
+        """Lift chat-only logprob rows into the same natural order as the tokens.
+
+        ``sampled_token_ids`` is scattered to full batch width, but the sampler
+        saw chat rows only, so its logprobs come back compacted 0..len(chat)-1.
+        The runner reads the two in parallel by request index
+        (``output.sampled_token_ids`` / ``output.logprobs``), so leaving them in
+        different row spaces hands a chat request the logprobs of whichever row
+        follows a PoC row. Same disease as the renumbering incident the natural
+        -order rule exists to prevent, just on the other tensor.
+
+        PoC rows get zero rows that nothing reads: PoC carries no sampling
+        params and never asks for logprobs.
+        """
+        from vllm.v1.outputs import LogprobsTensors
+
+        if lp is None:
+            return None
+        n_rows = lp.logprobs.shape[0]
+        if n_rows != idx.shape[0]:
+            # >1 row per request (spec decode) needs a per-request row map,
+            # which this path does not carry. Refuse rather than mis-index.
+            raise RuntimeError(
+                f"mixed PoC: cannot place {n_rows} logprob rows over "
+                f"{idx.shape[0]} chat rows; per-request row counts differ")
+
+        def _lift(t):
+            if t is None or t.numel() == 0:
+                return t
+            out = torch.zeros((n_full, *t.shape[1:]),
+                              dtype=t.dtype, device=t.device)
+            out[idx] = t
+            return out
+
+        return LogprobsTensors(
+            _lift(lp.logprob_token_ids),
+            _lift(lp.logprobs),
+            _lift(lp.selected_token_ranks),
         )

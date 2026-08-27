@@ -25,66 +25,6 @@ def test_core_never_imports_mixed():
     assert not offenders, f"core imports mixed (one-way rule): {offenders}"
 
 
-def test_hook_installs_and_fires(monkeypatch):
-    from gonka_poc.mixed import pre_forward
-
-    runner = types.SimpleNamespace(pre_forward_hooks=[])
-    monkeypatch.setenv("POC_MIXED_PRE_FORWARD", "1")
-    assert pre_forward.install(runner) is True
-    assert pre_forward.install(runner) is True  # idempotent
-    assert runner.pre_forward_hooks.count(pre_forward.poc_pre_forward) == 1
-
-    sched = types.SimpleNamespace(total_num_scheduled_tokens=536,
-                                  num_scheduled_tokens={"r1": 1, "r2": 1})
-    before = pre_forward.stats()["calls"]
-    for hook in runner.pre_forward_hooks:
-        hook(runner, sched, None, None, None, object())
-    s = pre_forward.stats()
-    assert s["calls"] == before + 1
-    assert s["last_num_tokens"] == 536
-    assert s["last_num_reqs"] == 2
-    assert s["has_attn_metadata"] is True
-    assert s["errors"] == 0
-
-
-def test_hook_never_raises():
-    """Скелет observe-only обязан глотать СВОИ ошибки (не тавтология: подаём
-    scheduler_output, который ломает внутреннюю арифметику)."""
-    from gonka_poc.mixed import pre_forward
-    before = pre_forward.stats()["errors"]
-    bad = types.SimpleNamespace(total_num_scheduled_tokens="abc",
-                                num_scheduled_tokens=None)
-    pre_forward.poc_pre_forward(None, bad, None, None, None, None)
-    s = pre_forward.stats()
-    assert s["errors"] == before + 1  # ошибка учтена, наружу не вышла
-
-
-def test_hook_signature_matches_residual_seam():
-    """Пин сигнатуры к резидуальному колл-сайту (kaitakuai/vllm@13e6bacd):
-    _hook(self, scheduler_output, input_ids, positions, inputs_embeds,
-    attn_metadata). Дрейф арности = TypeError на КАЖДОМ шаге движка."""
-    import inspect
-    from gonka_poc.mixed import pre_forward
-    params = list(inspect.signature(pre_forward.poc_pre_forward).parameters)
-    assert params == ["runner", "scheduler_output", "input_ids", "positions",
-                      "inputs_embeds", "attn_metadata"]
-
-
-def test_hook_records_ubatched_shape():
-    from gonka_poc.mixed import pre_forward
-    sched = types.SimpleNamespace(total_num_scheduled_tokens=8,
-                                  num_scheduled_tokens={"r": 8})
-    pre_forward.poc_pre_forward(None, sched, None, None, None, [{}, {}])
-    assert pre_forward.stats()["attn_is_ubatched"] is True
-    pre_forward.poc_pre_forward(None, sched, None, None, None, {})
-    assert pre_forward.stats()["attn_is_ubatched"] is False
-
-
-def test_install_refuses_without_residual_seam(monkeypatch):
-    from gonka_poc.mixed import pre_forward
-    monkeypatch.setenv("POC_MIXED_PRE_FORWARD", "1")
-    with pytest.raises(RuntimeError, match="pre_forward_hooks"):
-        pre_forward.install(types.SimpleNamespace())
 
 
 def test_policy_pure_functions():

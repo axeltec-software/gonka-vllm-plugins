@@ -689,6 +689,31 @@ async def get_generate_result(request: Request, request_id: str) -> dict:
     return response
 
 
+@router.get("/versions")
+async def get_versions(request: Request) -> dict:
+    """Feature-detection handshake for the network node (ADR-0015 §6).
+
+    ``poc_validation_inference`` used to reflect a borrow-RPC probe: whether
+    validation could run on leased KV blocks while inference kept serving.
+    Mixed decode-PoC removes the lease mechanism because coexistence is no
+    longer conditional — PoC and chat share the scheduler and the batch, so
+    validation always runs alongside inference. The field stays because the
+    node reads it to decide whether it may keep serving during a round; it is
+    now unconditionally true rather than a probe.
+    """
+    from vllm import __version__ as vllm_version
+    try:
+        import importlib.metadata as _md
+        gonka_poc_version = _md.version("gonka-poc")
+    except Exception:
+        gonka_poc_version = "unknown"
+    return {
+        "vllm_version": vllm_version,
+        "gonka_poc_version": gonka_poc_version,
+        "poc_validation_inference": True,
+    }
+
+
 @router.get("/status")
 async def get_status(request: Request) -> dict:
     return _get_api_status(id(request.app))

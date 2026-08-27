@@ -247,16 +247,13 @@ def test_snap_parity(s020, snew):
 
 # -------------------------------------------------------- chain rules
 def test_chain_rules_match_020_semantics():
-    """Pin the mixed-path chain rules to the 0.20 behavior: validation is
-    ALIGNED (mismatch counted per step, next step seeded from the reference —
-    no cascade), generation seeds from own k."""
-    from gonka_poc.mixed.runtime import aligned_step, keep_q_step
-    # validating: mismatch iff own != ref; prev_k for the next step is ref
-    assert aligned_step(3, 3) == (0, 3)
-    assert aligned_step(3, 4) == (1, 4)
-    # generating (no reference): never a mismatch, chain from own k
-    assert aligned_step(7, None) == (0, 7)
-    # q-vector retention: debug or validation keeps the step
+    """q-vector retention: debug or validation keeps the step.
+
+    The per-step comparison itself is asserted where it actually runs — the
+    live rule is the batched one in ``process_poc_outputs_from_hidden``
+    ((k != ref) & (k >= 0) & (margin >= tau)), not a helper.
+    """
+    from gonka_poc.mixed.runtime import keep_q_step
     assert keep_q_step(3, True, False)
     assert keep_q_step(64, False, True)
     assert not keep_q_step(65, False, False)

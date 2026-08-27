@@ -129,15 +129,6 @@ def slice_sampling_metadata(sm, rows, device):
 
 
 
-def aligned_step(own_k: int, reference_k):
-    """One validation comparison step, shared by both decode call-sites.
-    reference_k = the reference trajectory's sphere_k for this step, or None when
-    generating. Returns (mismatch_delta, next_prev_k): when validating, count a
-    mismatch if own_k differs and seed the next step from the reference k (aligned,
-    no cascade); when generating, seed from own_k."""
-    if reference_k is None:
-        return 0, own_k
-    return (1 if own_k != reference_k else 0), reference_k
 
 
 
@@ -191,7 +182,7 @@ class PoCDecodeState:
     vector_b64: str = ""
     n_sphere_mismatches: int = 0
     # validation reference trajectory (enforced_k_steps), or None for
-    # generation. index 0 = prefill k, 1..N = decode-step k. Drives aligned_step.
+    # generation. index 0 = prefill k, 1..N = decode-step k. Drives the per-step comparison.
     reference: list | None = None
     # --- GPU-native chaining: prev_k stays on device so the per-step host sync
     # disappears (-> async scheduling works). The trajectory accumulates on device

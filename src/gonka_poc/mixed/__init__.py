@@ -3,15 +3,11 @@
 
 Off unless explicitly enabled at launch. Depends one-way on the gonka_poc
 core (core never imports gonka_poc.mixed — pinned by
-tests/unit/test_mixed_contract.py). Engine coupling is exactly two seams:
+tests/unit/test_mixed_contract.py).
 
-  * ``GPUModelRunner.pre_forward_hooks`` — a 6-line residual extension
-    (kaitakuai/vllm branch mixed/pre-forward-hooks) delivering per-step
-    context right before the forward;
-  * ``--scheduler-cls`` — admission policy subclass (documented-risk seam:
-    upstream disclaims scheduler-interface stability; revalidated per minor).
-
-Everything else rides the same public points the core already uses.
+The engine calls into this package directly from the residual seams: the
+scheduler constructs ``PoCAdmission`` per step, and the model runner drives
+``PoCRunnerBridge`` around the forward. See gonka-ai/vllm#100.
 """
 
 from gonka_poc.mixed.admission import PoCAdmission  # noqa: E402
