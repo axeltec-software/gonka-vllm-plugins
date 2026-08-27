@@ -1,7 +1,13 @@
 """PoCWorkerExtension -- mixed into the vLLM V1 GPU Worker via ``--worker-extension-cls``.
 
-Activation: pass the mixed extension subclass (see the mixed subpackage) as
-``--worker-extension-cls``; this base carries only the shared surface.
+Carries BOTH PoC paths, because which one runs is a launch decision:
+
+* ``--poc-decode`` off (default): ``execute_poc_forward`` -- the v0.1.x
+  prefill scheme, driven over collective_rpc, artifacts bit-identical to the
+  shipped MLNode image. This is what the fleet validates today.
+* ``--poc-decode`` on: nonces ride the serving pipeline as engine requests
+  (routes -> generate(poc_params=...) -> scheduler admission -> runner
+  bridge) and nothing here is used beyond the probes.
 
 How vLLM wires this in (verified on the 0.25.1 line):
     ``vllm/v1/worker/worker_base.py:263-284`` (WorkerWrapperBase.init_worker)
@@ -10,22 +16,20 @@ How vLLM wires this in (verified on the 0.25.1 line):
     __init__ -- methods just become attributes on the live Worker.
 
 Inside any method, ``self`` is the live GPU Worker (self.model_runner,
-self.device, self.rank, self.vllm_config).
-
-In mixed mode PoC work does NOT enter through collective_rpc: nonces ride the
-serving pipeline as engine requests (routes -> generate(poc_params=...) ->
-scheduler admission -> runner bridge). This base class only carries
-introspection helpers shared by the mixed extension; keep method names
-prefixed ``poc_``/``mixed_`` -- vLLM asserts no attribute collisions at
-init_worker time, and return values must be msgpack-serialisable (no tensors).
+self.device, self.rank, self.vllm_config). Keep method names prefixed
+``poc_``/``mixed_``/``execute_poc_``, and return only msgpack-serialisable
+values -- no tensors.
 """
 import logging
+
+from typing import Any, Dict, List, Optional
+from gonka_poc._compat import current as _compat_current
 
 logger = logging.getLogger(__name__)
 
 
 class PoCWorkerExtension:
-    """Base RPC surface for PoC-enabled workers (see module docstring)."""
+    """RPC surface for PoC-enabled workers (see module docstring)."""
 
     def poc_worker_info(self) -> dict:
         """Liveness/identity probe for operators and tests."""
@@ -33,6 +37,119 @@ class PoCWorkerExtension:
             "rank": getattr(self, "rank", -1),
             "device": str(getattr(self, "device", "?")),
         }
+
+    def execute_poc_forward(
+        self,
+        *,
+        block_hash: str,
+        public_key: str,
+        nonces: List[int],
+        seq_len: int,
+        k_dim: int = 12,
+        poc_stronger_rng: bool = False,
+        borrowed_block_ids: Optional[List[int]] = None,
+        borrowed_stripe: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Execute one PoC forward pass on this worker rank.
+
+        Args:
+            block_hash, public_key: PoC scope tags fed into the seeded RNG.
+            nonces: list[int] of nonces to compute artifacts for; one batched
+                forward processes all of them.
+            seq_len: sequence length per nonce.
+            k_dim: artifact vector dimensionality (default 12).
+            poc_stronger_rng: if True, use murmur-concat RNG path; default
+                False (legacy seeded normal path).
+            borrowed_block_ids / borrowed_stripe: KV block lease from
+                ``gonka_poc_borrow_blocks`` (validation-without-abort path).
+                ``None`` = legacy in-place layout over blocks 0..N. Physical
+                block choice does not affect artifact values (address-only).
+
+        Returns:
+            ``{"artifacts": [{"nonce": int, "vector_b64": str}, ...],
+               "rank": int}``
+
+            On PP non-last ranks the underlying forward returns ``None``
+            (intermediate tensors were forwarded inter-rank); we mirror that
+            with an empty artifact list so the caller can aggregate uniformly.
+
+            Keep the payload msgpack-friendly. Do NOT return torch tensors.
+        """
+        # Deferred imports: pulling gonka_poc.poc.* requires a configured
+        # vllm runtime (vllm.logger), which is only available inside the
+        # worker process.
+        from gonka_poc.poc.data import encode_vector
+        from gonka_poc.poc.poc_model_runner import (
+            DEFAULT_K_DIM,
+            execute_poc_forward as _execute_poc_forward,
+        )
+
+        if not nonces:
+            return {"artifacts": [], "rank": int(getattr(self, "rank", -1))}
+
+        # vllm_config.model_config.get_hidden_size() is the canonical
+        # accessor on all supported minors; an unmapped minor already
+        # hard-fails in gonka_poc._compat, so no fallback is needed.
+        hidden_size = int(self.vllm_config.model_config.get_hidden_size())
+
+        result = _execute_poc_forward(
+            self,  # the live Worker; matches the ``worker`` param in poc_model_runner
+            block_hash,
+            public_key,
+            list(nonces),
+            int(seq_len),
+            int(hidden_size),
+            k_dim=int(k_dim) if k_dim is not None else DEFAULT_K_DIM,
+            poc_stronger_rng=bool(poc_stronger_rng),
+            borrowed_block_ids=(
+                list(borrowed_block_ids)
+                if borrowed_block_ids is not None else None),
+            borrowed_stripe=(
+                int(borrowed_stripe)
+                if borrowed_stripe is not None else None),
+        )
+
+        rank = int(getattr(self, "rank", -1))
+
+        # PP non-last ranks return None from the underlying forward.
+        if result is None:
+            return {"artifacts": [], "rank": rank}
+
+        vectors = result.get("vectors")
+        result_nonces = result.get("nonces", [])
+
+        artifacts: List[Dict[str, Any]] = []
+        if vectors is not None and len(result_nonces) > 0:
+            for i, nonce in enumerate(result_nonces):
+                artifacts.append({
+                    "nonce": int(nonce),
+                    "vector_b64": encode_vector(vectors[i]),
+                })
+
+        return {"artifacts": artifacts, "rank": rank}
+
+    def execute_poc_borrow_compat(self) -> Dict[str, Any]:
+        """Report whether borrowed-lease validation is bit-safe on this rank.
+
+        Borrowing is only safe where the legacy KV-scratch embeds path can
+        NEVER fire: on scratch-capable configs (a KV tensor matching the
+        model dtype and contiguous — bf16-KV models) the fleet's artifacts
+        depend on the scratch's deterministic self-overwrite, and a fresh
+        buffer + leased blocks would change bits (ADR-0015, Decision 5).
+        Conservative: ignores the size criterion, so a config that would
+        only sometimes select scratch still reports scratch_capable=True.
+        """
+        try:
+            kv_caches = _compat_current().get_kv_cache_pool(self.model_runner)
+            dtype = self.model_config.dtype
+        except Exception:
+            # No pool yet / unexpected shape: report NOT borrow-safe.
+            return {"scratch_capable": True,
+                    "rank": int(getattr(self, "rank", -1))}
+        scratch_capable = any(
+            kv.dtype == dtype and kv.is_contiguous() for kv in kv_caches)
+        return {"scratch_capable": bool(scratch_capable),
+                "rank": int(getattr(self, "rank", -1))}
 
 
 __all__ = ["PoCWorkerExtension"]

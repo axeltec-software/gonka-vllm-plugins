@@ -59,17 +59,33 @@ async def compute_nonce_artifacts(
     debug: bool = False,
     per_nonce_reflection: bool = False,
 ) -> List[dict]:
-    """Compute PoC artifacts for a set of nonces via the scheduler.
+    """Compute PoC artifacts for a set of nonces.
 
-    One PoC request per nonce is submitted through
-    ``engine_client.generate(poc_params=...)`` and gathered concurrently. The
-    scheduler runs pure-PoC batches (KV-bound decode on paged blocks, full
-    sphere_k trajectory) or interleaves prefill-only PoC with live chat —
-    PoC and chat co-exist with no chat freeze.
+    Both schemes are live in one process; ``params.scheme`` picks per request:
+
+    * "prefill" — the v0.1.x scheme over ``collective_rpc``. It never sets the
+      in-model PoC mask, so the wrappers stay at their identity branch and the
+      artifacts are bit-identical to the shipped MLNode image. This is what
+      the deployed fleet validates, so it is the default a chain gets when it
+      sends nothing new.
+    * "decode" — one PoC request per nonce through
+      ``engine_client.generate(poc_params=...)``: the scheduler mixes them
+      with live chat and the decode chain produces a sphere_k trajectory.
 
     This is the single source of truth for PoC artifact computation; both the
     /generate endpoint and the queue worker call it.
     """
+    if not poc_decode:
+        from gonka_poc.poc.prefill_path import compute_prefill_artifacts
+        return await compute_prefill_artifacts(
+            engine_client,
+            nonces=nonces,
+            block_hash=block_hash,
+            public_key=public_key,
+            seq_len=seq_len,
+            k_dim=k_dim,
+        )
+
     async def compute_one(nonce: int) -> Optional[dict]:
         inf_steps = (enforced_k_steps.get(nonce)
                      if enforced_k_steps else None)

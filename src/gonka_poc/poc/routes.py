@@ -4,7 +4,7 @@ import os
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, Request, HTTPException
 from pydantic import BaseModel, ConfigDict
@@ -104,7 +104,14 @@ class PoCParamsModel(BaseModel):
     model: str
     seq_len: int
     k_dim: int = 12
-    max_tokens: int = 0   # decode steps after prefill (0 = prefill-only)
+    # Which proof the chain is asking for. Explicit, because the two are
+    # different derivations and a node must never guess: "prefill" is the
+    # v0.1.x scheme whose artifacts the deployed fleet validates, "decode"
+    # is the chained sphere_k trajectory. Absent => prefill, so a chain that
+    # knows nothing about decode keeps working unchanged.
+    scheme: Literal["prefill", "decode"] = "prefill"
+    # Decode steps. Only read when scheme == "decode".
+    max_tokens: int = 0
 
 
 class PoCInitGenerateRequest(BaseModel):
@@ -383,7 +390,7 @@ async def _generation_loop(
                     config["block_hash"], config["public_key"],
                     config["seq_len"], config["k_dim"],
                     config["poc_stronger_rng"],
-                    poc_decode=mt > 0,
+                    poc_decode=(config.get("scheme", "prefill") == "decode"),
                     max_tokens=mt,
                     block_height=config["block_height"],
                 )
@@ -457,6 +464,7 @@ async def init_generate(request: Request, body: PoCInitGenerateRequest) -> dict:
         "seq_len": body.params.seq_len,
         "max_tokens": body.params.max_tokens,
         "k_dim": body.params.k_dim,
+        "scheme": body.params.scheme,
         "poc_stronger_rng": body.poc_stronger_rng,
     }
     
@@ -558,7 +566,7 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
             route_window=getattr(getattr(getattr(engine_client, "vllm_config", None),
                                          "cache_config", None), "poc_route_window", 256),
             poc_stronger_rng=body.poc_stronger_rng,
-            poc_decode=getattr(request.app.state, "poc_decode", False),
+            poc_decode=(body.params.scheme == "decode"),
             max_tokens=body.params.max_tokens,
             enforced_k_steps=body.enforced_k_steps,
             debug=body.debug,
@@ -592,7 +600,7 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
     
     start_time = time.time()
     computed_artifacts = []
-    poc_decode = getattr(request.app.state, "poc_decode", False)
+    poc_decode = body.params.scheme == "decode"
 
     step = body.batch_size or total_nonces   # 0 = one submission, engine does the batching
     for i in range(0, total_nonces, step):
