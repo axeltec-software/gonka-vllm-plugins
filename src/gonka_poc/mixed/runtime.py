@@ -23,10 +23,6 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-from gonka_poc.mixed.policy import (  # noqa: E402
-    decode_only_mixing_gate, poc_alloc_footprint, poc_is_pure_path, poc_share_budget, poc_step_num_tokens,
-)
-
 # MARGIN GATE (validator-side, mismatch-based). Count a teacher-forced disagreement as a
 # mismatch ONLY if the validator's own snap margin (top1-top2 cosine gap) >= tau. A tiny
 # margin means the query sat on a codebook boundary, where cross-HW/backend fp jitter flips
@@ -37,11 +33,6 @@ from gonka_poc.mixed.policy import (  # noqa: E402
 # tau PER MODEL (calibrate so the honest cross-HW floor drops below the acceptance
 # threshold while the subtlest fraud of concern stays above it).
 _MARGIN_TAU = float(os.environ.get("VLLM_POC_MARGIN_TAU", "0") or "0")
-
-# Bound on consecutive chat-prefill defers before a decoding PoC is forced an
-# exclusive step (fairness valve — keeps PoC from starving under chat churn).
-POC_DEFER_LIMIT = 4
-
 
 def _vector_artifact_cfg(runner) -> bool:
     """poc_vector_artifacts enabled? The dim is the PoC's own k_dim and the window
