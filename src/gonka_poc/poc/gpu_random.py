@@ -269,6 +269,7 @@ def random_pick_indices(
     device: torch.device,
     prev_point_ids: Optional[List[int]] = None,
     step: int = 0,
+    prefill_vector: bool = False,
 ) -> torch.Tensor:
     """Pick k dimensions per nonce deterministically (vectorized).
 
@@ -282,7 +283,13 @@ def random_pick_indices(
 
     seeds = []
     for i, nonce in enumerate(nonces):
-        if prev_point_ids is None:
+        if prefill_vector:
+            # v0.1.x seeding, no decode salt: the derivation the deployed
+            # fleet validates. Verified against the shipped MLNode image.
+            seeds.append(_seed_from_string(
+                f"{block_hash}_{public_key}_nonce_{nonce}_pick_{k}"
+            ))
+        elif prev_point_ids is None:
             seeds.append(_seed_from_string(
                 f"{block_hash}_{public_key}_nonce_{nonce}_pick_{k}_decode{step}"
             ))
@@ -491,3 +498,43 @@ def seeded_experts(block_hash: str, nonce: int, step: int, layer: int,
     steps = torch.tensor([step], dtype=torch.int64, device=device)
     logits = expert_logits_from_base(base, steps, n_experts, top_k, device)[0]
     return torch.topk(logits, top_k).indices
+
+# --- v0.1.x prefill scheme ------------------------------------------------
+# Used only when the node runs without --poc-decode. The decode stack has no
+# use for them, but removing them broke the prefill path outright.
+
+def derive_pseudo_input_ids(
+    block_hash: str,
+    public_key: str,
+    nonces: List[int],
+    seq_len: int,
+    vocab: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Deterministic pseudo token ids for token-id-dependent architectures.
+
+    Ids are derived from the same ``(block_hash, public_key, nonce)`` seed
+    scheme as the input embeddings (``_input_ids`` suffix), through the same
+    framework-independent murmur3 pipeline — pure integer arithmetic, stable
+    across torch versions (a consensus requirement).
+    """
+    batch_size = len(nonces)
+    keys = torch.arange(seq_len, dtype=torch.int32, device=device)
+    keys = keys.unsqueeze(0).expand(batch_size, -1)
+    seeds = torch.tensor(
+        [[_seed_from_string(f"{block_hash}_{public_key}_nonce{n}_input_ids")]
+         for n in nonces],
+        dtype=torch.int64, device=device)
+    # murmur3 yields uniform uint32; modulo bias at vocab << 2^32 is
+    # negligible for routing purposes.
+    return (_batched_murmur3_32(keys, seeds) % vocab).to(torch.int32).flatten()
+
+
+def apply_householder(
+    x: torch.Tensor,
+    v: torch.Tensor,
+) -> torch.Tensor:
+    """Apply Householder reflection: H @ x = x - 2*(v.x)*v"""
+    dot = (x * v).sum(dim=-1, keepdim=True)
+    return x - 2 * dot * v
+

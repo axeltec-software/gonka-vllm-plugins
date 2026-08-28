@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+
 from gonka_poc.mixed.policy import poc_cfg
 
 from vllm.logger import init_logger
@@ -57,6 +58,11 @@ class PoCRunnerBridge:
         pipeline still produces plausible trajectories — they are simply not the
         consensus computation. A silent fallback here is unacceptable.
         """
+        # Attached unconditionally: the wrappers are mask-gated and their
+        # mask-False branch is exact identity, so a prefill-only request --
+        # which runs over collective_rpc and never sets the mask -- still sees
+        # an untouched model. That is what lets one process serve both schemes
+        # and lets the chain pick per request instead of per launch.
         from gonka_poc.mixed.native import attach_native_poc
 
         runner = self.runner
