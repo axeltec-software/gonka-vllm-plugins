@@ -117,21 +117,24 @@ class PoCLayerWrapper(nn.Module):
         self.register_buffer("poc_mask", mask, persistent=False)
         self._inner_call = inner.forward
 
+    def _apply(self, x: torch.Tensor) -> torch.Tensor:
+        # Hidden states are [rows, hidden] on most models, but a model that keeps
+        # several per-row copies carries them in between (DeepSeek V4 repeats the
+        # row hc_mult times). Broadcast the per-row vector and mask over whatever
+        # dimensions sit there; the reflection always runs along the hidden dim.
+        n = x.shape[0]
+        pad = (1,) * (x.dim() - 2)
+        return _reflect(x, self.poc_v[:n].view(n, *pad, -1).to(x.dtype),
+                        self.poc_mask[:n].view(n, *pad, 1))
+
     def forward(self, *args, **kwargs):
         out = self._inner_call(*args, **kwargs)
-        if isinstance(out, tuple):
-            hidden = out[0]
-            n = hidden.shape[0]
-            m = self.poc_mask[:n].unsqueeze(-1)
-            v = self.poc_v[:n]  # per-row reflection vectors [n, hidden]
-            hidden = _reflect(hidden, v.to(hidden.dtype), m)
-            rest = list(out[1:])
-            if rest and rest[0] is not None:  # residual
-                rest[0] = _reflect(rest[0], v.to(rest[0].dtype), m)
-            return (hidden, *rest)
-        n = out.shape[0]
-        m = self.poc_mask[:n].unsqueeze(-1)
-        return _reflect(out, self.poc_v[:n].to(out.dtype), m)
+        if not isinstance(out, tuple):
+            return self._apply(out)
+        rest = list(out[1:])
+        if rest and rest[0] is not None:  # residual
+            rest[0] = self._apply(rest[0])
+        return (self._apply(out[0]), *rest)
 
 
 class PoCEmbeddingWrapper(nn.Module):
