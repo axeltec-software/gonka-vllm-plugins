@@ -14,7 +14,6 @@ from gonka_poc.poc.poc_params import PoCParams
 
 logger = logging.getLogger(__name__)
 
-
 def _server_engine() -> dict:
     """Engine identity of the SERVING box: version/commit, attention backend,
     cudagraph mode. Server truth — never recorded client-side."""
@@ -63,29 +62,19 @@ async def compute_nonce_artifacts(
 
     Both schemes are live in one process; ``params.scheme`` picks per request:
 
-    * "prefill" — the v0.1.x scheme over ``collective_rpc``. It never sets the
-      in-model PoC mask, so the wrappers stay at their identity branch and the
-      artifacts are bit-identical to the shipped MLNode image. This is what
-      the deployed fleet validates, so it is the default a chain gets when it
-      sends nothing new.
-    * "decode" — one PoC request per nonce through
-      ``engine_client.generate(poc_params=...)``: the scheduler mixes them
-      with live chat and the decode chain produces a sphere_k trajectory.
+    * "prefill" — the v0.1.x derivation: natural MoE router, per-block
+      reflection seed, unsalted pick. The default a chain gets when it sends
+      nothing new.
+    * "decode" — the chained sphere_k trajectory; ``max_tokens`` is its step
+      count and is read only here.
+
+    Both run through ``engine_client.generate``: one PoC request per nonce, the
+    scheduler mixes them with live chat, and the two derivations are kept apart
+    by per-row masks. There is no second execution path.
 
     This is the single source of truth for PoC artifact computation; both the
     /generate endpoint and the queue worker call it.
     """
-    if not poc_decode:
-        from gonka_poc.poc.prefill_path import compute_prefill_artifacts
-        return await compute_prefill_artifacts(
-            engine_client,
-            nonces=nonces,
-            block_hash=block_hash,
-            public_key=public_key,
-            seq_len=seq_len,
-            k_dim=k_dim,
-        )
-
     async def compute_one(nonce: int) -> Optional[dict]:
         inf_steps = (enforced_k_steps.get(nonce)
                      if enforced_k_steps else None)

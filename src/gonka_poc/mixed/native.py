@@ -257,7 +257,7 @@ class PoCRouterWrapper(nn.Module):
 
     def __init__(self, inner: nn.Module, route_base: torch.Tensor,
                  route_step: torch.Tensor, n_experts: int, top_k: int,
-                 mask: torch.Tensor):
+                 mask: torch.Tensor, route_mask: torch.Tensor):
         super().__init__()
         self.inner = inner
         self.n_experts = n_experts
@@ -265,6 +265,7 @@ class PoCRouterWrapper(nn.Module):
         self.register_buffer("poc_route_base", route_base, persistent=False)  # [max_tokens] int64
         self.register_buffer("poc_route_step", route_step, persistent=False)  # [max_tokens] int64 (shared)
         self.register_buffer("poc_mask", mask, persistent=False)
+        self.register_buffer("poc_route_mask", route_mask, persistent=False)  # [max_tokens] bool veto
 
     def __getattr__(self, name: str):
         # Delegate unknown attributes (e.g. `.weight`, quant scales) to the wrapped
@@ -279,7 +280,8 @@ class PoCRouterWrapper(nn.Module):
         out = self._inner_call(*args, **kwargs)
         logits = out[0] if isinstance(out, tuple) else out
         n = logits.shape[0]
-        m = self.poc_mask[:n].unsqueeze(-1)
+        # PoC row AND its scheme wants seeding; all-True veto == old behaviour.
+        m = (self.poc_mask[:n] & self.poc_route_mask[:n]).unsqueeze(-1)
         forced = expert_logits_from_base(                   # in-graph seeded selection
             self.poc_route_base[:n], self.poc_route_step[:n],
             self.n_experts, self.top_k, logits.device).to(logits.dtype)
@@ -370,6 +372,13 @@ class PoCNativeState:
         self.vectors_t, self.vectors = self.alloc_vectors(
             num_layers, max_tokens, hidden_size, device, dtype)
         self.mask = torch.zeros(max_tokens, dtype=torch.bool, device=device)
+        # Veto over `mask` for the MoE router: forced only where BOTH are set.
+        # A prefill-scheme row is a PoC row (reflection applies) but keeps the
+        # natural router. Keyed on the scheme, never the phase -- a decode
+        # request's own prefill snaps k0 and must stay seeded. All-True default
+        # => a pure decode round never writes it.
+        self.route_mask = torch.ones(max_tokens, dtype=torch.bool, device=device)
+        self._last_force: list | None = None   # skip the redundant rescatter
         self.embeds = torch.zeros(max_tokens, hidden_size, device=device, dtype=dtype)
         # (block_hash, nonce-or-None) -> per-layer vectors. nonce=None is the
         # per-block scheme (one draw shared by every nonce of the block); an int
@@ -595,11 +604,42 @@ class PoCNativeState:
         self._last_route_key = key
 
     def set_mask(self, row_mask: torch.Tensor | None) -> None:
-        """Set which rows are PoC this forward (in place). None -> all chat."""
+        """Set which rows are PoC this forward (in place). None -> all chat.
+
+        Deliberately leaves ``route_mask`` alone: it vetoes, so a row cleared
+        here is already excluded -- and touching it would invalidate
+        set_route_mask's memo on every step.
+        """
         self.mask.zero_()
         if row_mask is not None:
             n = row_mask.shape[0]
             self.mask[:n].copy_(row_mask)
+
+    def set_route_mask(self, row_force: list | None) -> None:
+        """Veto the seeded router on prefill-scheme rows.
+
+        ``None`` = every PoC row is decode-scheme: buffer stays all-True,
+        unwritten. A list is per-row (True = seeded). Memoized like set_routing
+        (``pinned_to_device`` page-locks a fresh buffer each call); the memo
+        keeps a copy so a caller reusing its list cannot alias it.
+        """
+        if row_force is None:
+            if self._last_force is not None:
+                self.route_mask.fill_(True)
+                self._last_force = None
+            return
+        if row_force == self._last_force:
+            return
+        n = len(row_force)
+        if n > self.route_mask.shape[0]:
+            # Loud: truncating would leave tail rows seeded on the prefill scheme.
+            raise ValueError(
+                f"PoC route veto has {n} rows, buffer holds "
+                f"{self.route_mask.shape[0]}")
+        self.route_mask.fill_(True)
+        self.route_mask[:n].copy_(
+            pinned_to_device(row_force, torch.bool, self.device))
+        self._last_force = list(row_force)
 
 
 def attach_native_poc(model: nn.Module, layers: list, embed_owner, max_tokens: int,
@@ -657,7 +697,8 @@ def attach_native_poc(model: nn.Module, layers: list, embed_owner, max_tokens: i
         state.router_meta.append((n_exp, top_k))
         _gate = moe.gate
         _install_poc_patch(_gate, PoCRouterWrapper(
-            _gate, route_base, state.route_step, n_exp, top_k, state.mask))
+            _gate, route_base, state.route_step, n_exp, top_k,
+            state.mask, state.route_mask))
         # The gate-logit forcing above is the single routing seam, as in
         # 0.20. The selection override is NOT installed: replacing the
         # engine's expert weights with the ladder softmax collapses the

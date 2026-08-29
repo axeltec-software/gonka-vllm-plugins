@@ -559,7 +559,9 @@ def process_poc_outputs_from_hidden(
         def _vector_b64():
             idx = random_pick_indices(
                 poc_params.block_hash, poc_params.public_key, [nonce],
-                hidden_size, poc_params.k_dim, runner.device)
+                hidden_size, poc_params.k_dim, runner.device,
+                # v0.1.x pick seed carries no decode salt.
+                prefill_vector=not getattr(poc_params, "poc_decode", False))
             xk = last_hidden[idx[0]]
             yk = apply_haar_rotation(
                 poc_params.block_hash, poc_params.public_key, [nonce],

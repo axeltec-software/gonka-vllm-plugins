@@ -25,3 +25,25 @@ def test_unknown_scheme_is_rejected():
     silently fall back to a derivation the caller did not ask for."""
     with pytest.raises(Exception):
         PoCParamsModel(model="m", seq_len=256, scheme="sphere")
+
+
+# --------------------------------------------------------------------------
+# Both schemes take ONE path: engine_client.generate, through the scheduler.
+# The v0.1.x collective_rpc entry point wrote KV blocks 0..N of the shared pool
+# and had to abort live inference before every chunk; nothing calls it now.
+
+def test_both_schemes_go_through_the_scheduler():
+    """No second execution path, and no flag selecting one."""
+    import inspect
+    import gonka_poc.poc.generate_queue as gq
+    src = inspect.getsource(gq.compute_nonce_artifacts)
+    assert "prefill_path" not in src, "the collective_rpc branch is back"
+    assert "engine_client.generate" in src
+
+
+def test_the_rpc_prefill_entry_point_is_gone():
+    """It aborted inference per chunk; keeping it reachable invites its return."""
+    import importlib
+    import pytest
+    with pytest.raises(ImportError):
+        importlib.import_module("gonka_poc.poc.prefill_path")

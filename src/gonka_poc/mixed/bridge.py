@@ -153,19 +153,37 @@ class PoCRunnerBridge:
                 row_nonces = [0] * n_rows
                 row_steps = [0] * n_rows
                 row_refl_nonces = [None] * n_rows
+                # poc_decode is the scheme: decode forces the MoE router and may
+                # seed reflections per nonce, prefill does neither. A pure decode
+                # round takes the None path and builds no list.
+                row_force_route = None
+                if any(not getattr(m["poc_params"], "poc_decode", False)
+                       for m in metadata):
+                    row_force_route = [False] * n_rows
                 for meta in metadata:
                     pp = meta["poc_params"]
                     stp = meta.get("decode_step", 0)
+                    decode = bool(getattr(pp, "poc_decode", False))
+                    per_nonce = decode and getattr(pp, "per_nonce_reflection", False)
                     for r in range(meta["start_idx"],
                                    meta["start_idx"] + meta["length"]):
                         if r < n_rows:
                             row_hashes[r] = pp.block_hash
                             row_nonces[r] = pp.nonce
                             row_steps[r] = stp
-                            if getattr(pp, "per_nonce_reflection", False):
+                            if row_force_route is not None:
+                                row_force_route[r] = decode
+                            # Ignored on prefill: a caller must not break
+                            # bit-compat with a flag the old chain cannot send.
+                            if per_nonce:
                                 row_refl_nonces[r] = pp.nonce
                 self.native.set_row_block_hashes(row_hashes, row_refl_nonces)
+                self.native.set_route_mask(row_force_route)
                 self.native.set_routing(row_hashes, row_nonces, row_steps)
+            else:
+                # Reopen the veto: a prefill round must not leave decode rows
+                # unforced on a later step.
+                self.native.set_route_mask(None)
 
     def _batch_view(self) -> tuple:
         ib = self.runner.input_batch
